@@ -150,7 +150,7 @@ alloy-primitives = { version = "1.5.7", default-features = false, features = [
 ] }
 alloy-contract = { version = "=1.6.3", default-features = false }
 alloy-rpc-types-eth = { version = "=1.6.3", default-features = false }
-alloy-rpc-types = { version = "=1.6.3", features = [
+alloy-rpc-types = { version = "=2.0.1", features = [
     "eth",
 ], default-features = false }
 alloy-rpc-types-engine = { version = "=1.6.3", default-features = false }
