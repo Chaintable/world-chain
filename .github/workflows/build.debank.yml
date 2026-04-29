@@ -97,4 +97,4 @@ jobs:
       - name: Lark Notification
         continue-on-error: true
         run: |
-          notiv3 "Blockchain megaevm pushed 🎉" ${REGISTRY}/${IMAGE}:${REVISION}
+          notiv3 "Blockchain world pushed 🎉" ${REGISTRY}/${IMAGE}:${REVISION}
