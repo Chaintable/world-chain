@@ -77,5 +77,5 @@ thiserror.workspace = true
 eyre.workspace = true
 async-trait.workspace = true
 serde.workspace = true
-sha1 = "0.10"
-md5 = "0.7"
+sha1.workspace = true
+md5.workspace = true
