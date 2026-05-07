@@ -1,0 +1,100 @@
+name: "Build artifacts"
+
+on:
+  pull_request:
+    branches:
+      - "debank"
+  release:
+    types:
+      - created
+
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-northeast-1
+  REGISTRY: 294354037686.dkr.ecr.ap-northeast-1.amazonaws.com
+  IMAGE: blockchain-world-x
+  DOCKERFILE: Dockerfile
+
+jobs:
+  build-artifacts:
+    strategy:
+      matrix:
+        arch: [ amd64, arm64 ]
+    runs-on: [self-hosted, "${{ matrix.arch }}"]
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - uses: tibdex/github-app-token@v1
+        id: generate-token
+        with:
+          app_id: ${{ secrets.RELEASE_MANAGER_APP_ID }}
+          private_key: ${{ secrets.RELEASE_MANAGER_APP_SECRET }}
+
+      - name: Set env (determine image tag)
+        run: |
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            echo "REVISION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
+          else
+            echo "REVISION=$(git rev-parse --short=7 HEAD)" >> $GITHUB_ENV
+          fi
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          file: ${{ env.DOCKERFILE }}
+          context: .
+          push: true
+          build-args: GITHUB_TOKEN=${{ steps.generate-token.outputs.token }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ matrix.arch }}-${{ env.REVISION }}
+          provenance: false
+
+
+  merge-docker-manifest:
+    runs-on: [ self-hosted, general ]
+    needs: build-artifacts
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Set env (determine image tag)
+        run: |
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            echo "REVISION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
+          else
+            echo "REVISION=$(git rev-parse --short=7 HEAD)" >> $GITHUB_ENV
+          fi
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Merge manifest
+        run: |
+          docker pull --platform=linux/amd64 ${REGISTRY}/${IMAGE}:amd64-${REVISION}
+          docker pull --platform=linux/arm64 ${REGISTRY}/${IMAGE}:arm64-${REVISION}
+          docker buildx imagetools create --tag ${REGISTRY}/${IMAGE}:${REVISION} ${REGISTRY}/${IMAGE}:amd64-${REVISION} ${REGISTRY}/${IMAGE}:arm64-${REVISION}
+          docker rmi ${REGISTRY}/${IMAGE}:amd64-${REVISION}
+          docker rmi ${REGISTRY}/${IMAGE}:arm64-${REVISION}
+      - name: Lark Notification
+        continue-on-error: true
+        run: |
+          notiv3 "Blockchain world pushed 🎉" ${REGISTRY}/${IMAGE}:${REVISION}

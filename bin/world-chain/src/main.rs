@@ -10,7 +10,8 @@ use world_chain_node::{
     FlashblocksOpApi, OpApiExtServer, context::WorldChainDefaultContext, node::WorldChainNode,
 };
 use world_chain_rpc::{
-    EthApiExtServer, SequencerClient, Simulate, SimulateApiServer, WorldChainEthApiExt,
+    EthApiExtServer, SequencerClient, Simulate, SimulateApiServer, TraceApiServer,
+    WorldChainEthApiExt, trace::DebankTraceApi,
 };
 
 #[cfg(all(feature = "jemalloc", unix))]
@@ -55,7 +56,9 @@ fn main() {
                 ctx.modules.replace_configured(eth_api_ext.into_rpc())?;
                 ctx.modules
                     .replace_configured(FlashblocksOpApi.into_rpc())?;
-
+                ctx.modules.merge_configured(
+                    DebankTraceApi::new(ctx.registry.eth_api().clone()).into_rpc(),
+                )?;
                 if config.args.simulate_enabled {
                     let chain_spec = ctx.provider().chain_spec();
                     let evm_config = OpEvmConfig::new(chain_spec, OpRethReceiptBuilder::default());

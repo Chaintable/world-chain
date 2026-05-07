@@ -19,3 +19,7 @@ pub use core::{EthApiExtServer, WorldChainEthApiExt};
 
 pub mod simulate;
 pub use simulate::{Simulate, SimulateApiServer};
+
+pub mod debank;
+pub mod trace;
+pub use trace::{DebankTraceApi, TraceApiServer};

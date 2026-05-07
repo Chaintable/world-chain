@@ -12,3 +12,4 @@ pkg/contracts/sepolia_load_test.json
 .DS_Store
 **/.DS_Store
 **/proptest-regressions/
+.idea
