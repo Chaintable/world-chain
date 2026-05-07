@@ -30,6 +30,8 @@ reth-storage-api.workspace = true
 reth-node-builder.workspace = true
 reth-tasks.workspace = true
 reth-chain-state.workspace = true
+reth-revm.workspace = true
+reth-trie.workspace = true
 
 # op-reth
 reth-optimism-rpc.workspace = true
@@ -43,14 +45,23 @@ alloy-primitives.workspace = true
 alloy-eips.workspace = true
 alloy-consensus.workspace = true
 alloy-rpc-types.workspace = true
+alloy-rpc-types-eth.workspace = true
 alloy-rpc-types-engine.workspace = true
+alloy-rlp.workspace = true
+alloy-genesis.workspace = true
+alloy-network.workspace = true
 
 op-alloy-rpc-types.workspace = true
 op-alloy-network.workspace = true
 op-alloy-rpc-types-engine.workspace = true
+op-alloy-consensus.workspace = true
 
 # revm
 revm-primitives.workspace = true
+revm-bytecode.workspace = true
+revm-database.workspace = true
+revm-inspectors.workspace = true
+revm-interpreter.workspace = true
 
 # tokio
 tokio.workspace = true
@@ -64,3 +75,7 @@ reqwest.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 eyre.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+sha1.workspace = true
+md5.workspace = true

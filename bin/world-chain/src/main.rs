@@ -7,7 +7,7 @@ use world_chain_cli::{WorldChainArgs, WorldChainNodeConfig};
 use world_chain_node::{
     FlashblocksOpApi, OpApiExtServer, context::WorldChainDefaultContext, node::WorldChainNode,
 };
-use world_chain_rpc::{EthApiExtServer, SequencerClient, WorldChainEthApiExt};
+use world_chain_rpc::{DebankTraceApi, DebankTraceApiServer, EthApiExtServer, SequencerClient, WorldChainEthApiExt};
 
 #[cfg(all(feature = "jemalloc", unix))]
 #[global_allocator]
@@ -50,6 +50,9 @@ fn main() {
                     ctx.modules.replace_configured(eth_api_ext.into_rpc())?;
                     ctx.modules
                         .replace_configured(FlashblocksOpApi.into_rpc())?;
+                    ctx.modules.merge_configured(
+                        DebankTraceApi::new(ctx.registry.eth_api().clone()).into_rpc(),
+                    )?;
                     Ok(())
                 })
                 .launch()

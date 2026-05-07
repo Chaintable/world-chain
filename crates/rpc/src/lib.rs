@@ -16,3 +16,7 @@ pub use transactions::EthTransactionsExt;
 
 pub mod core;
 pub use core::{EthApiExtServer, WorldChainEthApiExt};
+
+pub mod debank;
+pub mod trace;
+pub use trace::{DebankTraceApi, DebankTraceApiServer};
