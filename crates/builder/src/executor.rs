@@ -4,25 +4,24 @@ use alloy_op_evm::{
     block::{OpTxEnv, receipt_builder::OpReceiptBuilder},
 };
 
+use alloy_primitives::B256;
+use op_revm::{OpHaltReason, OpSpecId};
 use reth_evm::{
     Database, Evm, FromRecoveredTx, FromTxWithEncoded,
     block::{BlockExecutionError, BlockExecutor, CommitChanges},
     execute::{
         BasicBlockBuilder, BlockAssemblerInput, BlockBuilder, BlockBuilderOutcome, ExecutorTx,
     },
-    op_revm::{OpHaltReason, OpSpecId},
 };
+use reth_node_api::NodePrimitives;
 use reth_optimism_chainspec::OpChainSpec;
 use reth_optimism_evm::OpRethReceiptBuilder;
 use reth_optimism_node::OpBlockAssembler;
 use reth_optimism_primitives::{OpReceipt, OpTransactionSigned};
-use reth_primitives::{NodePrimitives, Recovered, RecoveredBlock, SealedHeader};
+use reth_primitives_traits::{Recovered, RecoveredBlock, SealedHeader};
 use reth_provider::StateProvider;
-use revm::{
-    DatabaseCommit,
-    context::{BlockEnv, result::ExecutionResult},
-    database::states::bundle_state::BundleRetention,
-};
+use reth_trie_common::updates::TrieUpdates;
+use revm::{DatabaseCommit, context::BlockEnv, database::states::bundle_state::BundleRetention};
 use revm_database::BundleState;
 use std::{sync::Arc, time::Instant};
 
@@ -94,9 +93,7 @@ where
     fn execute_transaction_with_commit_condition(
         &mut self,
         tx: impl ExecutorTx<Self::Executor>,
-        f: impl FnOnce(
-            &ExecutionResult<<<Self::Executor as BlockExecutor>::Evm as Evm>::HaltReason>,
-        ) -> CommitChanges,
+        f: impl FnOnce(&<Self::Executor as BlockExecutor>::Result) -> CommitChanges,
     ) -> Result<Option<u64>, BlockExecutionError> {
         let (tx_env, tx) = tx.into_parts();
         if let Some(gas_used) = self
@@ -105,7 +102,7 @@ where
             .execute_transaction_with_commit_condition((tx_env, &tx), f)?
         {
             self.inner.transactions.push(tx);
-            Ok(Some(gas_used))
+            Ok(Some(gas_used.tx_gas_used()))
         } else {
             Ok(None)
         }
@@ -114,6 +111,7 @@ where
     fn finish(
         self,
         _state: impl StateProvider,
+        _state_root_precomputed: Option<(B256, TrieUpdates)>,
     ) -> Result<BlockBuilderOutcome<N>, BlockExecutionError> {
         unimplemented!(
             "finish is not supported on FlashblocksBlockBuilder; use finish_with_bundle instead"

@@ -20,8 +20,7 @@ use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterato
 use reth_evm::ConfigureEvm;
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_node::txpool::OpTransactionValidator;
-use reth_optimism_primitives::OpTransactionSigned;
-use reth_primitives::{Block, NodePrimitives, SealedBlock};
+use reth_primitives_traits::{BlockTy, SealedBlock, TxTy};
 use reth_provider::{BlockReaderIdExt, ChainSpecProvider, StateProviderFactory};
 use reth_transaction_pool::{
     TransactionOrigin, TransactionValidationOutcome, TransactionValidator,
@@ -67,8 +66,8 @@ impl<Client, Tx, Evm> WorldChainTransactionValidator<Client, Tx, Evm>
 where
     Client: ChainSpecProvider<ChainSpec: OpHardforks>
         + StateProviderFactory
-        + BlockReaderIdExt<Block = reth_primitives::Block<OpTransactionSigned>>,
-    Tx: WorldChainPoolTransaction,
+        + BlockReaderIdExt<Block = BlockTy<Evm::Primitives>>,
+    Tx: WorldChainPoolTransaction<Consensus = TxTy<Evm::Primitives>>,
     Evm: ConfigureEvm,
 {
     /// Create a new [`WorldChainTransactionValidator`].
@@ -260,13 +259,13 @@ impl<Client, Tx, Evm> TransactionValidator for WorldChainTransactionValidator<Cl
 where
     Client: ChainSpecProvider<ChainSpec: OpHardforks>
         + StateProviderFactory
-        + BlockReaderIdExt<Block = Block<OpTransactionSigned>>,
-    Tx: WorldChainPoolTransaction<Consensus = OpTransactionSigned>,
+        + BlockReaderIdExt<Block = BlockTy<Evm::Primitives>>,
+    Tx: WorldChainPoolTransaction<Consensus = TxTy<Evm::Primitives>>,
     Evm: ConfigureEvm,
 {
     type Transaction = Tx;
 
-    type Block = <Evm::Primitives as NodePrimitives>::Block;
+    type Block = BlockTy<Evm::Primitives>;
 
     async fn validate_transaction(
         &self,
@@ -309,12 +308,12 @@ where
 
 #[cfg(test)]
 pub mod tests {
-    use alloy_consensus::{Block, Header};
+    use alloy_consensus::{Block, BlockBody, Header};
     use alloy_primitives::{Address, address};
     use alloy_sol_types::SolCall;
     use reth_optimism_node::OpEvmConfig;
     use reth_optimism_primitives::OpTransactionSigned;
-    use reth_primitives::{BlockBody, SealedBlock};
+    use reth_primitives_traits::SealedBlock;
     use reth_transaction_pool::{
         Pool, TransactionPool, TransactionValidator, blobstore::InMemoryBlobStore,
     };

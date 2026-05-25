@@ -13,9 +13,11 @@ use crate::{
         context::PayloadBuilderCtx, context_builder::PayloadBuilderCtxBuilder,
         payload_builder::FlashblockPayloadBuilder,
     },
+    utils::estimated_da_size_bytes,
 };
 use alloy_eips::Encodable2718;
 use alloy_primitives::TxHash;
+use op_revm::OpSpecId;
 use reth_evm::{
     Evm, EvmFactory,
     block::{BlockExecutor, BlockExecutorFactory},
@@ -34,27 +36,28 @@ use reth_basic_payload_builder::{
     PayloadConfig,
 };
 use reth_evm::{
-    ConfigureEvm, Database, EvmEnv, execute::BlockBuilderOutcome, op_revm::OpSpecId,
+    ConfigureEvm, Database, EvmEnv, RecoveredTx, execute::BlockBuilderOutcome,
     precompiles::PrecompilesMap,
 };
-use reth_node_api::{BuiltPayloadExecutedBlock, PayloadBuilderAttributes, PayloadBuilderError};
-use reth_primitives::NodePrimitives;
+use reth_node_api::{BuiltPayloadExecutedBlock, NodePrimitives, PayloadBuilderError};
+use reth_payload_primitives::BuildNextEnv;
 use reth_revm::database::StateProviderDatabase;
 use revm_database::State;
 use tracing::trace;
 use world_chain_primitives::access_list::FlashblockAccessList;
 
 use reth_optimism_chainspec::OpChainSpec;
-use reth_optimism_forks::OpHardforks;
 use reth_optimism_node::{
     OpEvmConfig, OpNextBlockEnvAttributes, OpRethReceiptBuilder, txpool::OpPooledTx,
 };
 use reth_optimism_payload_builder::{
     builder::{ExecutionInfo, OpPayloadTransactions},
     config::OpBuilderConfig,
-    payload::{OpBuiltPayload, OpPayloadBuilderAttributes},
+    payload::{OpBuiltPayload, OpPayloadAttrs, OpPayloadBuilderAttributes},
 };
-use reth_optimism_primitives::{OpPrimitives, OpReceipt, OpTransactionSigned};
+use reth_optimism_primitives::{
+    OpPrimitives, OpReceipt, OpTransactionSigned, transaction::OpTransaction,
+};
 use reth_payload_util::{NoopPayloadTransactions, PayloadTransactions};
 use reth_provider::{BlockExecutionOutput, ChainSpecProvider, ProviderError, StateProviderFactory};
 
@@ -120,6 +123,8 @@ where
             mut cached_reads,
             cancel,
             best_payload,
+            execution_cache: _,
+            trie_handle: _,
         } = args;
         self.metrics.increment_attempts();
         let build_started = Instant::now();
@@ -180,15 +185,16 @@ where
             PayloadBuilderCtx: PayloadBuilderCtx<Transaction = Pool::Transaction>,
         >,
 {
-    type Attributes = OpPayloadBuilderAttributes<OpTxEnvelope>;
+    type Attributes = OpPayloadAttrs;
     type BuiltPayload = OpBuiltPayload;
 
     fn try_build(
         &self,
         args: BuildArguments<Self::Attributes, Self::BuiltPayload>,
     ) -> Result<BuildOutcome<Self::BuiltPayload>, PayloadBuilderError> {
+        let converted_args = convert_build_args(args)?;
         self.build_payload(
-            args,
+            converted_args,
             |attrs| {
                 self.best_transactions
                     .best_transactions(self.pool.clone(), attrs)
@@ -216,9 +222,12 @@ where
             cached_reads: Default::default(),
             cancel: Default::default(),
             best_payload: None,
+            execution_cache: None,
+            trie_handle: None,
         };
+        let converted_args = convert_build_args(args)?;
         self.build_payload(
-            args,
+            converted_args,
             |_| NoopPayloadTransactions::<Pool::Transaction>::default(),
             None,
         )?
@@ -259,8 +268,9 @@ where
         ),
         PayloadBuilderError,
     > {
+        let converted_args = convert_build_args(args)?;
         self.build_payload(
-            args,
+            converted_args,
             |attrs| {
                 self.best_transactions
                     .best_transactions(self.pool.clone(), attrs)
@@ -268,6 +278,41 @@ where
             committed_payload,
         )
     }
+}
+
+/// Converts `BuildArguments` from [`OpPayloadAttrs`] to [`OpPayloadBuilderAttributes`], decoding
+/// the RPC transaction bytes into typed transactions.
+fn convert_build_args(
+    args: BuildArguments<OpPayloadAttrs, OpBuiltPayload>,
+) -> Result<
+    BuildArguments<OpPayloadBuilderAttributes<OpTxEnvelope>, OpBuiltPayload>,
+    PayloadBuilderError,
+> {
+    let BuildArguments {
+        config,
+        cached_reads,
+        execution_cache,
+        trie_handle,
+        cancel,
+        best_payload,
+    } = args;
+    let parent_hash = config.parent_header.hash();
+    let payload_id = config.payload_id;
+    let builder_attrs =
+        OpPayloadBuilderAttributes::from_rpc_attrs(parent_hash, payload_id, config.attributes.0)
+            .map_err(PayloadBuilderError::other)?;
+    Ok(BuildArguments {
+        config: PayloadConfig {
+            parent_header: config.parent_header,
+            attributes: builder_attrs,
+            payload_id,
+        },
+        cached_reads,
+        execution_cache,
+        trie_handle,
+        cancel,
+        best_payload,
+    })
 }
 
 /// Builds the payload on top of the state.
@@ -304,28 +349,9 @@ where
     );
 
     let _enter = span.enter();
-    let gas_limit = ctx.attributes().gas_limit.unwrap_or(ctx.parent().gas_limit);
 
-    let attributes = OpNextBlockEnvAttributes {
-        timestamp: ctx.attributes().timestamp(),
-        suggested_fee_recipient: ctx.attributes().suggested_fee_recipient(),
-        prev_randao: ctx.attributes().prev_randao(),
-        gas_limit,
-        parent_beacon_block_root: ctx.attributes().parent_beacon_block_root(),
-        extra_data: if ctx
-            .spec()
-            .is_holocene_active_at_timestamp(ctx.attributes().timestamp())
-        {
-            ctx.attributes()
-                .get_holocene_extra_data(
-                    ctx.spec()
-                        .base_fee_params_at_timestamp(ctx.attributes().timestamp()),
-                )
-                .map_err(PayloadBuilderError::other)?
-        } else {
-            Default::default()
-        },
-    };
+    let attributes =
+        OpNextBlockEnvAttributes::build_next_env(ctx.attributes(), ctx.parent(), ctx.spec())?;
 
     // Prepare EVM environment.
     let evm_env = ctx
@@ -335,7 +361,7 @@ where
 
     let execution_conext = ctx
         .evm_config()
-        .context_for_next_block(ctx.parent(), attributes)
+        .context_for_next_block(ctx.parent(), attributes.clone())
         .map_err(PayloadBuilderError::other)?;
 
     let committed_state = CommittedState::<OpRethReceiptBuilder>::try_from(committed_payload)
@@ -347,7 +373,7 @@ where
 
     trace!(
         target: "flashblocks::payload_builder",
-        gas_limit,
+        gas_limit = attributes.gas_limit,
         effective_gas_limit,
         committed_gas_used = committed_state.gas_used,
         timestamp = ctx.attributes().timestamp(),
@@ -471,6 +497,7 @@ fn build_inner<'a, Txs, Ctx, Pool, R>(
 >
 where
     R: OpReceiptBuilder + Default,
+    R::Transaction: Encodable2718 + OpTransaction,
     Pool: TransactionPool,
     Txs: PayloadTransactions,
     Txs::Transaction: OpPooledTx,
@@ -512,7 +539,11 @@ where
         committed_payload.map_or(ExecutionInfo::default(), |p| ExecutionInfo {
             total_fees: p.fees(),
             cumulative_gas_used: p.block().gas_used(),
-            ..Default::default()
+            cumulative_da_bytes_used: committed_state
+                .transactions_iter()
+                .filter(|tx| !tx.tx().is_deposit())
+                .map(estimated_da_size_bytes)
+                .sum(),
         })
     };
 

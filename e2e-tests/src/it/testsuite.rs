@@ -1,17 +1,21 @@
 use alloy_consensus::BlockHeader;
-use alloy_network::{Ethereum, EthereumWallet, TransactionBuilder, eip2718::Encodable2718};
+use alloy_eips::eip2930::AccessList;
+use alloy_network::{Ethereum, EthereumWallet, NetworkTransactionBuilder, eip2718::Encodable2718};
 use alloy_primitives::{Bytes, b64};
 use alloy_provider::ProviderBuilder;
 use alloy_rpc_types::TransactionRequest;
 use alloy_rpc_types_engine::PayloadStatusEnum;
+use alloy_signer::SignerSync;
 use eyre::eyre::eyre;
 use op_alloy_consensus::OpTxEnvelope;
 use reth_chainspec::EthChainSpec;
 use reth_e2e_test_utils::testsuite::actions::Action;
 use reth_network::{NetworkSyncUpdater, SyncState};
+use reth_node_api::PayloadAttributes;
 use reth_optimism_node::utils::optimism_payload_attributes;
+use reth_tasks::Runtime;
 use reth_transaction_pool::TransactionPool;
-use revm_primitives::{Address, B256, U256};
+use revm_primitives::{Address, B256, TxKind, U256};
 use std::{
     sync::{
         Arc,
@@ -55,9 +59,12 @@ use world_chain_primitives::{
         Authorization, Authorized, AuthorizedMsg, AuthorizedPayload, FlashblocksP2PMsg,
         StartPublish,
     },
+    payload_id::force_op_payload_id_v3,
     primitives::{ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1, FlashblocksPayloadV1},
+    transaction::{SignedWip1001, TxWip1001, Wip1001Signature, WorldChainTxEnvelope},
 };
 use world_chain_test_utils::{
+    Wip1001NodeContext,
     e2e_harness::setup::{
         CHAIN_SPEC, create_test_transaction, encode_eip1559_params, setup,
         setup_with_block_uncompressed_size_limit, setup_with_tx_peers,
@@ -85,9 +92,67 @@ async fn create_priority_transaction(
 
     let wallet = EthereumWallet::from(signer(signer_index));
     let signed =
-        <TransactionRequest as TransactionBuilder<Ethereum>>::build(tx_request, &wallet).await?;
+        <TransactionRequest as NetworkTransactionBuilder<Ethereum>>::build(tx_request, &wallet)
+            .await?;
 
     Ok((signed.encoded_2718().into(), *signed.tx_hash()))
+}
+
+fn create_wip1001_transaction() -> eyre::Result<(Bytes, B256)> {
+    let session_signer = signer(0);
+    let session_key = session_signer
+        .credential()
+        .verifying_key()
+        .to_encoded_point(true);
+
+    let tx = TxWip1001 {
+        chain_id: CHAIN_SPEC.chain.id(),
+        nonce: 0,
+        max_priority_fee_per_gas: 1_000_000_000,
+        max_fee_per_gas: 2_000_000_000,
+        gas_limit: 21_000,
+        to: TxKind::Call(Address::default()),
+        value: U256::from(1),
+        input: Bytes::new(),
+        access_list: AccessList::default(),
+        world_id_account: account(0),
+        signature_type: Wip1001Signature::SECP256K1_TYPE,
+        session_key: Bytes::copy_from_slice(session_key.as_bytes()),
+    };
+
+    let signature = session_signer.sign_hash_sync(&tx.signing_hash())?;
+    let envelope = WorldChainTxEnvelope::from(SignedWip1001::new_signed(
+        tx,
+        Wip1001Signature::Secp256k1(signature),
+    ));
+    let tx_hash = envelope.tx_hash();
+
+    Ok((envelope.encoded_2718().into(), tx_hash))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wip1001_node_accepts_wip1001_transaction() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let (_, mut nodes, _tasks, _, _) =
+        setup::<Wip1001NodeContext>(1, optimism_payload_attributes, false).await?;
+    let node = &mut nodes[0].node;
+
+    let (raw_tx, tx_hash) = create_wip1001_transaction()?;
+    assert_eq!(node.rpc.inject_tx(raw_tx).await?, tx_hash);
+
+    let payload = node.advance_block().await?;
+    assert!(
+        payload
+            .block()
+            .body()
+            .transactions
+            .iter()
+            .any(|tx| tx.hash() == &tx_hash),
+        "WIP-1001 transaction should be included"
+    );
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -131,10 +196,12 @@ async fn test_transaction_pool_ordering() -> eyre::Result<()> {
     let non_pbh_tx = tx(CHAIN_SPEC.chain.id(), None, 0, Address::default(), 210_000);
     let wallet = signer(0);
     let signer_wallet = EthereumWallet::from(wallet);
-    let signed =
-        <TransactionRequest as TransactionBuilder<Ethereum>>::build(non_pbh_tx, &signer_wallet)
-            .await
-            .unwrap();
+    let signed = <TransactionRequest as NetworkTransactionBuilder<Ethereum>>::build(
+        non_pbh_tx,
+        &signer_wallet,
+    )
+    .await
+    .unwrap();
     let non_pbh_hash = node.rpc.inject_tx(signed.encoded_2718().into()).await?;
     let mut pbh_tx_hashes = vec![];
     let signers = signers.clone();
@@ -1277,13 +1344,12 @@ async fn test_engine_driver_pending_block_queries() -> eyre::Result<()> {
         .verifying_key();
 
     let authorization_gen =
-        move |parent_hash: B256, attrs: reth_optimism_node::OpPayloadAttributes| {
+        move |parent_hash: B256, attrs: reth_optimism_payload_builder::OpPayloadAttrs| {
             let authorizer_sk = ed25519_dalek::SigningKey::from_bytes(&[0; 32]);
-            let payload_id =
-                reth_optimism_payload_builder::payload_id_optimism(&parent_hash, &attrs, 3);
+            let payload_id = force_op_payload_id_v3(attrs.payload_id(&parent_hash));
             world_chain_primitives::p2p::Authorization::new(
                 payload_id,
-                reth_node_api::PayloadAttributes::timestamp(&attrs),
+                attrs.payload_attributes.timestamp,
                 &authorizer_sk,
                 builder_vk,
             )
@@ -1472,13 +1538,12 @@ async fn test_eth_api_assertions() -> eyre::Result<()> {
         .verifying_key();
 
     let authorization_gen =
-        move |parent_hash: B256, attrs: reth_optimism_node::OpPayloadAttributes| {
+        move |parent_hash: B256, attrs: reth_optimism_payload_builder::OpPayloadAttrs| {
             let authorizer_sk = ed25519_dalek::SigningKey::from_bytes(&[0; 32]);
-            let payload_id =
-                reth_optimism_payload_builder::payload_id_optimism(&parent_hash, &attrs, 3);
+            let payload_id = force_op_payload_id_v3(attrs.payload_id(&parent_hash));
             world_chain_primitives::p2p::Authorization::new(
                 payload_id,
-                reth_node_api::PayloadAttributes::timestamp(&attrs),
+                attrs.payload_attributes.timestamp,
                 &authorizer_sk,
                 builder_vk,
             )
@@ -1514,7 +1579,6 @@ async fn test_eth_api_assertions() -> eyre::Result<()> {
                     use alloy_provider::Provider;
                     let provider = ProviderBuilder::<_, _, op_alloy_network::Optimism>::default()
                         .network::<op_alloy_network::Optimism>()
-                        .with_recommended_fillers()
                         .connect_http(url);
 
                     let pending = provider
@@ -1558,7 +1622,6 @@ async fn test_eth_api_assertions() -> eyre::Result<()> {
                 Box::pin(async move {
                     let provider = ProviderBuilder::<_, _, op_alloy_network::Optimism>::default()
                         .network::<op_alloy_network::Optimism>()
-                        .with_recommended_fillers()
                         .connect_http(url);
 
                     // --- fetch_block!(Pending) ---
@@ -1707,13 +1770,12 @@ async fn test_assertion_driven_event_stream() -> eyre::Result<()> {
         .verifying_key();
 
     let authorization_gen =
-        move |parent_hash: B256, attrs: reth_optimism_node::OpPayloadAttributes| {
+        move |parent_hash: B256, attrs: reth_optimism_payload_builder::OpPayloadAttrs| {
             let authorizer_sk = ed25519_dalek::SigningKey::from_bytes(&[0; 32]);
-            let payload_id =
-                reth_optimism_payload_builder::payload_id_optimism(&parent_hash, &attrs, 3);
+            let payload_id = force_op_payload_id_v3(attrs.payload_id(&parent_hash));
             world_chain_primitives::p2p::Authorization::new(
                 payload_id,
-                reth_node_api::PayloadAttributes::timestamp(&attrs),
+                attrs.payload_attributes.timestamp,
                 &authorizer_sk,
                 builder_vk,
             )
@@ -2284,6 +2346,7 @@ async fn test_peer_monitoring() -> eyre::Result<()> {
             flashblocks: Some(test_flashblocks_args(&authorizer_sk, &builder_sk)),
             tx_peers: None,
             disable_bootnodes: true,
+            simulate_enabled: false,
         };
 
         let wc_config = args.clone().into_config(&mut node_config)?;
@@ -2333,7 +2396,7 @@ async fn test_peer_monitoring() -> eyre::Result<()> {
     p2p_key_file.flush()?;
     let p2p_key_path = p2p_key_file.path().to_path_buf();
 
-    let exec1 = TaskExecutor::default();
+    let exec1 = Runtime::test();
 
     let builder1 = SigningKey::from_bytes(&[1; 32]);
     let (p2p_1, record_1, network_1, _exit_1, _node_1) = setup_monitoring_node(
@@ -2346,7 +2409,7 @@ async fn test_peer_monitoring() -> eyre::Result<()> {
     )
     .await?;
 
-    let exec2 = TaskExecutor::default();
+    let exec2 = Runtime::test();
 
     let peer1_id = record_1.id;
     let peer1_addr = record_1.tcp_addr();

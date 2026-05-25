@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use crate::{node::tx, utils::signer};
 use alloy_consensus::Header;
 use alloy_eips::Encodable2718;
-use alloy_network::{Ethereum, EthereumWallet, TransactionBuilder};
+use alloy_network::{Ethereum, EthereumWallet, NetworkTransactionBuilder};
 use alloy_provider::ProviderBuilder;
 use alloy_rpc_types::TransactionRequest;
 use alloy_sol_types::{SolCall, sol};
@@ -11,6 +11,7 @@ use futures::{StreamExt, stream::FuturesOrdered};
 use reqwest::Url;
 use reth_chainspec::EthChainSpec;
 use reth_e2e_test_utils::testsuite::NodeClient;
+use reth_node_api::EngineTypes;
 use reth_optimism_node::OpEngineTypes;
 use reth_optimism_primitives::{OpReceipt, OpTransactionSigned};
 use reth_rpc_api::EthApiClient;
@@ -85,9 +86,10 @@ impl TxType {
         };
 
         let tx = tx(CHAIN_SPEC.chain_id(), Some(calldata), nonce, to, 100_000);
-        let signed = <TransactionRequest as TransactionBuilder<Ethereum>>::build(tx, &wallet)
-            .await
-            .unwrap();
+        let signed =
+            <TransactionRequest as NetworkTransactionBuilder<Ethereum>>::build(tx, &wallet)
+                .await
+                .unwrap();
 
         signed.encoded_2718().into()
     }
@@ -97,12 +99,18 @@ impl TxType {
 const MAX_SIGNERS: u32 = 19;
 
 #[derive(Debug)]
-pub struct TxSpammer {
-    pub rpc: Vec<NodeClient<OpEngineTypes>>,
+pub struct TxSpammer<P = OpEngineTypes>
+where
+    P: EngineTypes,
+{
+    pub rpc: Vec<NodeClient<P>>,
     pub sequence: Vec<TxType>,
 }
 
-impl TxSpammer {
+impl<P> TxSpammer<P>
+where
+    P: EngineTypes + Send + Sync + 'static,
+{
     /// Spawns a background task that continuously sends transactions.
     ///
     /// Deploys test contracts on startup, then sends batches of `tpf` transactions per flashblock.

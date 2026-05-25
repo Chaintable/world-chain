@@ -1,12 +1,15 @@
 use crate::{
-    DEV_WORLD_ID, PBH_DEV_ENTRYPOINT,
+    DEV_WORLD_ID, ERC1967_IMPLEMENTATION_SLOT, GENESIS, L1_BLOCK_PREDEPLOY, PBH_DEV_ENTRYPOINT,
+    SET_L1_BLOCK_SELECTOR, SYSTEM_DEPOSITOR, WORLD_ID_ACCOUNT_MANAGER,
+    WORLD_ID_ACCOUNT_MANAGER_IMPL_V1, WORLD_ID_ACCOUNT_MANAGER_IMPL_V1_RUNTIME_BYTECODE,
+    WORLD_ID_ACCOUNT_MANAGER_RUNTIME_BYTECODE,
     node::{test_config_with_peers_and_gossip, tx},
     utils::{account, signer, tree_root},
 };
 use alloy_eips::{eip2718::Encodable2718, eip7685::EMPTY_REQUESTS_HASH};
 use alloy_genesis::{Genesis, GenesisAccount};
-use alloy_network::{Ethereum, EthereumWallet, TransactionBuilder};
-use alloy_primitives::{Address, B64, Sealed, address};
+use alloy_network::{Ethereum, EthereumWallet, NetworkTransactionBuilder};
+use alloy_primitives::{Address, B64, Sealed, hex};
 use alloy_rpc_types::TransactionRequest;
 use alloy_rpc_types_engine::{
     CancunPayloadFields, ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3,
@@ -18,7 +21,7 @@ use op_alloy_consensus::{OpTxEnvelope, TxDeposit, encode_holocene_extra_data};
 use op_alloy_rpc_types_engine::{
     OpExecutionData, OpExecutionPayload, OpExecutionPayloadSidecar, OpExecutionPayloadV4,
 };
-use reth_chainspec::EthChainSpec;
+use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_e2e_test_utils::{
     Adapter, NodeHelperType, TmpDB,
     testsuite::{BlockInfo, Environment, NodeClient, NodeState},
@@ -26,8 +29,8 @@ use reth_e2e_test_utils::{
 use reth_engine_tree::tree::TreeConfig;
 use reth_network_api::test_utils::PeersHandleProvider;
 use reth_node_api::{
-    FullNodeTypesAdapter, NodeAddOns, NodeTypes, NodeTypesWithDBAdapter, PayloadAttributes,
-    PayloadTypes,
+    ConsensusEngineHandle, EngineTypes, FullNodeTypesAdapter, NodeAddOns, NodeTypes,
+    NodeTypesWithDBAdapter, PayloadAttributes, PayloadTypes,
 };
 use reth_node_builder::{
     EngineNodeLauncher, Node, NodeBuilder, NodeComponents, NodeComponentsBuilder, NodeConfig,
@@ -37,11 +40,10 @@ use reth_node_builder::{
 use reth_node_core::args::{PayloadBuilderArgs, RpcServerArgs};
 use reth_optimism_chainspec::{OpChainSpec, OpChainSpecBuilder};
 use reth_optimism_forks::OpHardfork;
-use reth_optimism_node::{OpEngineTypes, OpPayloadAttributes};
-use reth_optimism_payload_builder::payload_id_optimism;
-use reth_optimism_primitives::OpPrimitives;
+use reth_optimism_node::OpPayloadAttributes;
+use reth_optimism_payload_builder::OpPayloadAttrs;
 use reth_provider::providers::{BlockchainProvider, ChainStorage};
-use reth_tasks::TaskExecutor;
+use reth_tasks::{Runtime, TaskExecutor};
 use revm_primitives::{B256, Bytes, TxKind, U256};
 use std::{
     collections::BTreeMap,
@@ -52,12 +54,13 @@ use std::{
 use tracing::{info, span};
 use world_chain_node::{
     FlashblocksOpApi, OpApiExtServer,
-    node::{WorldChainNode, WorldChainNodeContext},
+    node::{WorldChainNode, WorldChainNodeContext, WorldChainNodePrimitiveTypes},
 };
-use world_chain_primitives::{flashblocks::Flashblock, p2p::Authorization};
+use world_chain_primitives::{
+    flashblocks::Flashblock, p2p::Authorization, payload_id::force_op_payload_id_v3,
+};
 
 use world_chain_pool::{
-    BasicWorldChainPool,
     root::LATEST_ROOT_SLOT,
     validator::{MAX_U16, PBH_GAS_LIMIT_SLOT, PBH_NONCE_LIMIT_SLOT},
 };
@@ -65,15 +68,50 @@ use world_chain_rpc::{EthApiExtServer, SequencerClient, WorldChainEthApiExt};
 
 use super::spammer::{TxSpammer, TxType};
 
-const GENESIS: &str = include_str!("../../res/genesis.json");
+/// Decode a static hex constant into raw bytecode for genesis allocation.
+///
+/// The bytecode constants are formatted with `concat!` for readability, so this
+/// helper accepts whitespace and an optional `0x` prefix while still failing
+/// fast if the checked-in constant is malformed.
+fn bytes_from_hex(hex_str: &str) -> Bytes {
+    let normalized: String = hex_str
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+    Bytes::from(hex::decode(normalized.trim_start_matches("0x")).expect("valid bytecode hex"))
+}
 
-// Optimism protocol constants - these addresses are defined by the Optimism specification
-const L1_BLOCK_PREDEPLOY: Address = address!("4200000000000000000000000000000000000015");
-const SYSTEM_DEPOSITOR: Address = address!("DeaDDEaDDeAdDeAdDEAdDEaddeAddEAdDEAd0001");
+/// Encode an address as a 32-byte storage word.
+///
+/// Solidity stores `address` values right-aligned in a full EVM word. The
+/// ERC-1967 implementation slot therefore needs the proxy implementation
+/// address left-padded with zeros.
+fn address_word(address: Address) -> B256 {
+    let mut word = [0u8; 32];
+    word[12..32].copy_from_slice(address.as_slice());
+    B256::from(word)
+}
+
+/// Decode a fixed 32-byte hex constant used as a storage key.
+fn b256_from_hex(hex_str: &str) -> B256 {
+    B256::from_slice(&hex::decode(hex_str).expect("valid B256 hex"))
+}
+
+/// Build the storage injected into the preloaded account-manager proxy.
+///
+/// Genesis preloading installs runtime bytecode directly, so the proxy
+/// constructor never gets a chance to set its implementation. This storage map
+/// performs exactly that constructor side effect by writing the ERC-1967
+/// implementation slot. Initialization data is intentionally not modeled here.
+fn world_id_account_manager_proxy_storage() -> BTreeMap<B256, B256> {
+    BTreeMap::from_iter([(
+        b256_from_hex(ERC1967_IMPLEMENTATION_SLOT),
+        address_word(WORLD_ID_ACCOUNT_MANAGER_IMPL_V1),
+    )])
+}
 
 fn create_l1_attributes_deposit_tx() -> Bytes {
-    const SELECTOR: [u8; 4] = [0x44, 0x0a, 0x5e, 0x20];
-    let mut calldata = SELECTOR.to_vec();
+    let mut calldata = SET_L1_BLOCK_SELECTOR.to_vec();
     calldata.extend_from_slice(&[0u8; 32]);
     calldata.extend_from_slice(&[0u8; 32]);
     calldata.extend_from_slice(&[0u8; 32]);
@@ -98,7 +136,11 @@ fn create_l1_attributes_deposit_tx() -> Bytes {
     buf.into()
 }
 
-/// L1 attributes deposit transaction - required as the first transaction in Optimism blocks
+/// Encoded Optimism L1 attributes deposit transaction.
+///
+/// Optimism payloads require this system transaction as the first transaction in
+/// every block. The harness uses a single zero-valued fixture because tests only
+/// need the transaction to satisfy block-shape rules.
 pub static TX_SET_L1_BLOCK: LazyLock<Bytes> = LazyLock::new(create_l1_attributes_deposit_tx);
 
 pub struct WorldChainTestingNodeContext<T: WorldChainTestContextBounds>
@@ -107,6 +149,7 @@ where
 {
     pub node: WorldChainNodeTestContext<T>,
     pub ext_context: WorldChainNodeExtContext<T>,
+    pub beacon_engine_handle: ConsensusEngineHandle<<WorldChainNode<T> as NodeTypes>::Payload>,
 }
 
 type WorldChainNodeExtContext<T> = <T as WorldChainNodeContext<
@@ -124,17 +167,17 @@ type WorldChainNodeTestContext<T> = NodeHelperType<
 
 pub async fn setup<T>(
     num_nodes: u8,
-    attributes_generator: impl Fn(u64) -> <<WorldChainNode<T> as NodeTypes>::Payload as PayloadTypes>::PayloadBuilderAttributes + Send + Sync + Copy + 'static,
+    attributes_generator: impl Fn(u64) -> <<WorldChainNode<T> as NodeTypes>::Payload as PayloadTypes>::PayloadAttributes + Send + Sync + Copy + 'static,
     flashblocks_enabled: bool,
 ) -> eyre::Result<(
     Range<u8>,
     Vec<WorldChainTestingNodeContext<T>>,
     TaskExecutor,
-    Environment<OpEngineTypes>,
-    TxSpammer,
+    Environment<<WorldChainNode<T> as NodeTypes>::Payload>,
+    TxSpammer<<WorldChainNode<T> as NodeTypes>::Payload>,
 )>
 where
-    T: WorldChainTestContextBounds,
+    T: WorldChainTestContextBounds<ChainSpec = OpChainSpec>,
     WorldChainNode<T>: WorldChainNodeTestBounds<T>,
 {
     setup_inner::<T>(
@@ -151,7 +194,7 @@ where
 
 pub async fn setup_with_block_uncompressed_size_limit<T>(
     num_nodes: u8,
-    attributes_generator: impl Fn(u64) -> <<WorldChainNode<T> as NodeTypes>::Payload as PayloadTypes>::PayloadBuilderAttributes + Send + Sync + Copy + 'static,
+    attributes_generator: impl Fn(u64) -> <<WorldChainNode<T> as NodeTypes>::Payload as PayloadTypes>::PayloadAttributes + Send + Sync + Copy + 'static,
     flashblocks_enabled: bool,
     block_uncompressed_size_limit: Option<u64>,
     chain_spec: Arc<OpChainSpec>,
@@ -159,11 +202,11 @@ pub async fn setup_with_block_uncompressed_size_limit<T>(
     Range<u8>,
     Vec<WorldChainTestingNodeContext<T>>,
     TaskExecutor,
-    Environment<OpEngineTypes>,
-    TxSpammer,
+    Environment<<WorldChainNode<T> as NodeTypes>::Payload>,
+    TxSpammer<<WorldChainNode<T> as NodeTypes>::Payload>,
 )>
 where
-    T: WorldChainTestContextBounds,
+    T: WorldChainTestContextBounds<ChainSpec = OpChainSpec>,
     WorldChainNode<T>: WorldChainNodeTestBounds<T>,
 {
     setup_inner::<T>(
@@ -181,7 +224,7 @@ where
 /// Setup multiple nodes with optional transaction propagation peer configuration
 pub async fn setup_with_tx_peers<T>(
     num_nodes: u8,
-    attributes_generator: impl Fn(u64) -> <<WorldChainNode<T> as NodeTypes>::Payload as PayloadTypes>::PayloadBuilderAttributes + Send + Sync + Copy + 'static,
+    attributes_generator: impl Fn(u64) -> <<WorldChainNode<T> as NodeTypes>::Payload as PayloadTypes>::PayloadAttributes + Send + Sync + Copy + 'static,
     enable_tx_peers: bool,
     disable_gossip: bool,
     flashblocks_enabled: bool,
@@ -190,11 +233,11 @@ pub async fn setup_with_tx_peers<T>(
     Range<u8>,
     Vec<WorldChainTestingNodeContext<T>>,
     TaskExecutor,
-    Environment<OpEngineTypes>,
-    TxSpammer,
+    Environment<<WorldChainNode<T> as NodeTypes>::Payload>,
+    TxSpammer<<WorldChainNode<T> as NodeTypes>::Payload>,
 )>
 where
-    T: WorldChainTestContextBounds,
+    T: WorldChainTestContextBounds<ChainSpec = OpChainSpec>,
     WorldChainNode<T>: WorldChainNodeTestBounds<T>,
 {
     setup_inner::<T>(
@@ -211,7 +254,7 @@ where
 
 async fn setup_inner<T>(
     num_nodes: u8,
-    attributes_generator: impl Fn(u64) -> <<WorldChainNode<T> as NodeTypes>::Payload as PayloadTypes>::PayloadBuilderAttributes + Send + Sync + Copy + 'static,
+    attributes_generator: impl Fn(u64) -> <<WorldChainNode<T> as NodeTypes>::Payload as PayloadTypes>::PayloadAttributes + Send + Sync + Copy + 'static,
     enable_tx_peers: bool,
     disable_gossip: bool,
     flashblocks_enabled: bool,
@@ -221,18 +264,18 @@ async fn setup_inner<T>(
     Range<u8>,
     Vec<WorldChainTestingNodeContext<T>>,
     TaskExecutor,
-    Environment<OpEngineTypes>,
-    TxSpammer,
+    Environment<<WorldChainNode<T> as NodeTypes>::Payload>,
+    TxSpammer<<WorldChainNode<T> as NodeTypes>::Payload>,
 )>
 where
-    T: WorldChainTestContextBounds,
+    T: WorldChainTestContextBounds<ChainSpec = OpChainSpec>,
     WorldChainNode<T>: WorldChainNodeTestBounds<T>,
 {
     unsafe {
         std::env::set_var("PRIVATE_KEY", DEV_WORLD_ID.to_string());
     }
 
-    let exec = TaskExecutor::default();
+    let exec = Runtime::test();
 
     let mut node_config: NodeConfig<OpChainSpec> = NodeConfig::new(chain_spec.clone())
         .with_chain(chain_spec)
@@ -259,13 +302,13 @@ where
     // is 0.0.0.0 by default
     node_config.network.addr = [127, 0, 0, 1].into();
 
-    let mut environment = Environment::default();
+    let mut environment = Environment::<<WorldChainNode<T> as NodeTypes>::Payload>::default();
     environment.block_timestamp_increment = 12;
 
     let mut node_contexts =
         Vec::<WorldChainTestingNodeContext<T>>::with_capacity(num_nodes as usize);
 
-    let mut spammer = TxSpammer {
+    let mut spammer = TxSpammer::<<WorldChainNode<T> as NodeTypes>::Payload> {
         rpc: Vec::new(),
         sequence: vec![TxType::Sstore, TxType::Deploy, TxType::DeployAndDestruct],
     };
@@ -332,6 +375,7 @@ where
                 })
                 .await?;
 
+        let beacon_engine_handle = node.add_ons_handle.beacon_engine_handle.clone();
         let mut node = WorldChainNodeTestContext::new(node, attributes_generator).await?;
         let genesis = node.inner.chain_spec().sealed_genesis_header();
 
@@ -351,7 +395,11 @@ where
             node.connect(&mut first_node.node).await;
         }
 
-        let world_chain_test_node = WorldChainTestingNodeContext { node, ext_context };
+        let world_chain_test_node = WorldChainTestingNodeContext {
+            node,
+            ext_context,
+            beacon_engine_handle,
+        };
 
         node_contexts.push(world_chain_test_node);
     }
@@ -364,7 +412,8 @@ where
 
         let auth = node.auth_server_handle();
         let url = node.rpc_url();
-        let client = NodeClient::new(rpc, auth, url);
+        let client: NodeClient<<WorldChainNode<T> as NodeTypes>::Payload> =
+            NodeClient::new_with_beacon_engine(rpc, auth, url, n.beacon_engine_handle.clone());
 
         environment.node_clients.push(client.clone());
 
@@ -404,6 +453,22 @@ pub static CHAIN_SPEC: LazyLock<OpChainSpec> = LazyLock::new(|| {
                     ),
                 ]))),
             )])
+            .extend_accounts(vec![
+                (
+                    WORLD_ID_ACCOUNT_MANAGER_IMPL_V1,
+                    GenesisAccount::default().with_code(Some(bytes_from_hex(
+                        WORLD_ID_ACCOUNT_MANAGER_IMPL_V1_RUNTIME_BYTECODE,
+                    ))),
+                ),
+                (
+                    WORLD_ID_ACCOUNT_MANAGER,
+                    GenesisAccount::default()
+                        .with_code(Some(bytes_from_hex(
+                            WORLD_ID_ACCOUNT_MANAGER_RUNTIME_BYTECODE,
+                        )))
+                        .with_storage(Some(world_id_account_manager_proxy_storage())),
+                ),
+            ])
             .extend_accounts(vec![(
                 account(0),
                 GenesisAccount::default().with_balance(U256::from(100_000_000_000_000_000u64)),
@@ -429,13 +494,13 @@ pub fn current_timestamp() -> u64 {
 pub fn create_authorization_generator(
     block_hash: B256,
     builder_verifying_key: ed25519_dalek::VerifyingKey,
-) -> impl Fn(OpPayloadAttributes) -> Authorization + Clone {
-    move |attrs: OpPayloadAttributes| {
+) -> impl Fn(OpPayloadAttrs) -> Authorization + Clone {
+    move |attrs: OpPayloadAttrs| {
         let authorizer_sk = SigningKey::from_bytes(&[0; 32]);
-        let payload_id = payload_id_optimism(&block_hash, &attrs, 3);
+        let payload_id = force_op_payload_id_v3(attrs.payload_id(&block_hash));
         Authorization::new(
             payload_id,
-            attrs.timestamp(),
+            attrs.payload_attributes.timestamp,
             &authorizer_sk,
             builder_verifying_key,
         )
@@ -447,7 +512,7 @@ pub fn build_payload_attributes(
     timestamp: u64,
     eip1559_params: B64,
     transactions: Option<Vec<Bytes>>,
-) -> OpPayloadAttributes {
+) -> OpPayloadAttrs {
     OpPayloadAttributes {
         payload_attributes: alloy_rpc_types_engine::PayloadAttributes {
             timestamp,
@@ -455,13 +520,17 @@ pub fn build_payload_attributes(
             suggested_fee_recipient: Address::random(),
             withdrawals: Some(vec![]),
             parent_beacon_block_root: Some(B256::ZERO),
+            slot_number: None,
         },
         transactions,
         no_tx_pool: Some(false),
         eip_1559_params: Some(eip1559_params),
         gas_limit: Some(200_000_000), // 200MGas
-        min_base_fee: Some(0),
+        min_base_fee: CHAIN_SPEC
+            .is_fork_active_at_timestamp(OpHardfork::Jovian, timestamp)
+            .then_some(0),
     }
+    .into()
 }
 
 /// Encode EIP-1559 parameters for Holocene from a chain spec at a given timestamp
@@ -476,9 +545,10 @@ pub fn encode_eip1559_params<C: EthChainSpec>(chain_spec: &C, timestamp: u64) ->
 
 /// Sign a transaction request and return the raw encoded bytes
 pub async fn sign_transaction(tx_request: TransactionRequest, wallet: &EthereumWallet) -> Bytes {
-    let signed = <TransactionRequest as TransactionBuilder<Ethereum>>::build(tx_request, wallet)
-        .await
-        .unwrap();
+    let signed =
+        <TransactionRequest as NetworkTransactionBuilder<Ethereum>>::build(tx_request, wallet)
+            .await
+            .unwrap();
     signed.encoded_2718().into()
 }
 
@@ -492,9 +562,10 @@ pub async fn create_test_transaction(signer_index: u32, nonce: u64) -> (Bytes, B
         210_000,
     );
     let wallet = EthereumWallet::from(signer(signer_index));
-    let signed = <TransactionRequest as TransactionBuilder<Ethereum>>::build(tx_request, &wallet)
-        .await
-        .unwrap();
+    let signed =
+        <TransactionRequest as NetworkTransactionBuilder<Ethereum>>::build(tx_request, &wallet)
+            .await
+            .unwrap();
     (signed.encoded_2718().into(), *signed.tx_hash())
 }
 
@@ -559,9 +630,10 @@ pub fn execution_data_from_from_reduced_flashblock(
     }
 }
 
-/// Consolidated trait bound for WorldChainNode testing context
+/// Consolidated trait bound for a World Chain testing context.
 pub trait WorldChainTestContextBounds:
-    WorldChainNodeContext<
+    WorldChainNodePrimitiveTypes<Payload: EngineTypes, ChainSpec: EthereumHardforks>
+    + WorldChainNodeContext<
         FullNodeTypesAdapter<
             WorldChainNode<Self>,
             TmpDB,
@@ -596,13 +668,6 @@ pub trait WorldChainTestContextBounds:
                     BlockchainProvider<NodeTypesWithDBAdapter<WorldChainNode<Self>, TmpDB>>,
                 >,
                 Network: PeersHandleProvider,
-                Pool = BasicWorldChainPool<
-                    FullNodeTypesAdapter<
-                        WorldChainNode<Self>,
-                        TmpDB,
-                        BlockchainProvider<NodeTypesWithDBAdapter<WorldChainNode<Self>, TmpDB>>,
-                    >,
-                >,
             >,
         >,
     > + Send
@@ -610,9 +675,10 @@ pub trait WorldChainTestContextBounds:
     + 'static
 where
     WorldChainNode<Self>: NodeTypes<
-            Primitives = OpPrimitives,
-            ChainSpec = OpChainSpec,
-            Storage: ChainStorage<OpPrimitives>,
+            Primitives = <Self as WorldChainNodePrimitiveTypes>::Primitives,
+            ChainSpec = <Self as WorldChainNodePrimitiveTypes>::ChainSpec,
+            Payload = <Self as WorldChainNodePrimitiveTypes>::Payload,
+            Storage: ChainStorage<<Self as WorldChainNodePrimitiveTypes>::Primitives>,
         > + Node<
             FullNodeTypesAdapter<
                 WorldChainNode<Self>,
@@ -639,23 +705,16 @@ where
                         BlockchainProvider<NodeTypesWithDBAdapter<WorldChainNode<Self>, TmpDB>>,
                     >,
                     Network: PeersHandleProvider,
-                    Pool = BasicWorldChainPool<
-                        FullNodeTypesAdapter<
-                            WorldChainNode<Self>,
-                            TmpDB,
-                            BlockchainProvider<NodeTypesWithDBAdapter<WorldChainNode<Self>, TmpDB>>,
-                        >,
-                    >,
                 >,
             >,
         >,
 {
 }
 
-// Adapter<Self, BlockchainProvider<NodeTypesWithDBAdapter<Self, TmpDB>>>,
 impl<T> WorldChainTestContextBounds for T
 where
-    T: WorldChainNodeContext<
+    T: WorldChainNodePrimitiveTypes<Payload: EngineTypes, ChainSpec: EthereumHardforks>
+        + WorldChainNodeContext<
             FullNodeTypesAdapter<
                 WorldChainNode<T>,
                 TmpDB,
@@ -663,18 +722,18 @@ where
             >,
             AddOns: NodeAddOns<
                 Adapter<
-                    WorldChainNode<Self>,
-                    BlockchainProvider<NodeTypesWithDBAdapter<WorldChainNode<Self>, TmpDB>>,
+                    WorldChainNode<T>,
+                    BlockchainProvider<NodeTypesWithDBAdapter<WorldChainNode<T>, TmpDB>>,
                 >,
             > + RethRpcAddOns<
                 Adapter<
-                    WorldChainNode<Self>,
-                    BlockchainProvider<NodeTypesWithDBAdapter<WorldChainNode<Self>, TmpDB>>,
+                    WorldChainNode<T>,
+                    BlockchainProvider<NodeTypesWithDBAdapter<WorldChainNode<T>, TmpDB>>,
                 >,
             > + EngineValidatorAddOn<
                 Adapter<
-                    WorldChainNode<Self>,
-                    BlockchainProvider<NodeTypesWithDBAdapter<WorldChainNode<Self>, TmpDB>>,
+                    WorldChainNode<T>,
+                    BlockchainProvider<NodeTypesWithDBAdapter<WorldChainNode<T>, TmpDB>>,
                 >,
             >,
             ComponentsBuilder: NodeComponentsBuilder<
@@ -690,20 +749,14 @@ where
                         BlockchainProvider<NodeTypesWithDBAdapter<WorldChainNode<T>, TmpDB>>,
                     >,
                     Network: PeersHandleProvider,
-                    Pool = BasicWorldChainPool<
-                        FullNodeTypesAdapter<
-                            WorldChainNode<T>,
-                            TmpDB,
-                            BlockchainProvider<NodeTypesWithDBAdapter<WorldChainNode<T>, TmpDB>>,
-                        >,
-                    >,
                 >,
             >,
         >,
     WorldChainNode<T>: NodeTypes<
-            Primitives = OpPrimitives,
-            ChainSpec = OpChainSpec,
-            Storage: ChainStorage<OpPrimitives>,
+            Primitives = <T as WorldChainNodePrimitiveTypes>::Primitives,
+            ChainSpec = <T as WorldChainNodePrimitiveTypes>::ChainSpec,
+            Payload = <T as WorldChainNodePrimitiveTypes>::Payload,
+            Storage: ChainStorage<<T as WorldChainNodePrimitiveTypes>::Primitives>,
         > + Node<
             FullNodeTypesAdapter<
                 WorldChainNode<T>,
@@ -730,25 +783,19 @@ where
                         BlockchainProvider<NodeTypesWithDBAdapter<WorldChainNode<T>, TmpDB>>,
                     >,
                     Network: PeersHandleProvider,
-                    Pool = BasicWorldChainPool<
-                        FullNodeTypesAdapter<
-                            WorldChainNode<T>,
-                            TmpDB,
-                            BlockchainProvider<NodeTypesWithDBAdapter<WorldChainNode<T>, TmpDB>>,
-                        >,
-                    >,
                 >,
             >,
         >,
 {
 }
 
-/// Wrapper trait that consolidates all trait bounds for WorldChainNode<T> in testing
+/// Wrapper trait that consolidates all trait bounds for `WorldChainNode<T>` in testing.
 pub trait WorldChainNodeTestBounds<T>:
     NodeTypes<
-        Primitives = OpPrimitives,
-        ChainSpec = OpChainSpec,
-        Storage: ChainStorage<OpPrimitives>,
+        Primitives = <T as WorldChainNodePrimitiveTypes>::Primitives,
+        ChainSpec = <T as WorldChainNodePrimitiveTypes>::ChainSpec,
+        Payload = <T as WorldChainNodePrimitiveTypes>::Payload,
+        Storage: ChainStorage<<T as WorldChainNodePrimitiveTypes>::Primitives>,
     > + Node<
         FullNodeTypesAdapter<Self, TmpDB, BlockchainProvider<NodeTypesWithDBAdapter<Self, TmpDB>>>,
         AddOns = T::AddOns,
@@ -762,9 +809,10 @@ where
 impl<T, Ctx> WorldChainNodeTestBounds<Ctx> for T
 where
     T: NodeTypes<
-            Primitives = OpPrimitives,
-            ChainSpec = OpChainSpec,
-            Storage: ChainStorage<OpPrimitives>,
+            Primitives = <Ctx as WorldChainNodePrimitiveTypes>::Primitives,
+            ChainSpec = <Ctx as WorldChainNodePrimitiveTypes>::ChainSpec,
+            Payload = <Ctx as WorldChainNodePrimitiveTypes>::Payload,
+            Storage: ChainStorage<<Ctx as WorldChainNodePrimitiveTypes>::Primitives>,
         > + Node<
             FullNodeTypesAdapter<T, TmpDB, BlockchainProvider<NodeTypesWithDBAdapter<T, TmpDB>>>,
             AddOns = Ctx::AddOns,

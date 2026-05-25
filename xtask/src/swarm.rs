@@ -14,12 +14,12 @@ use alloy_primitives::B256;
 use clap::Parser;
 use eyre::Result;
 use reth_node_api::PayloadAttributes;
-use reth_optimism_node::{OpPayloadAttributes, utils::optimism_payload_attributes};
-use reth_optimism_payload_builder::payload_id_optimism;
+use reth_optimism_node::utils::optimism_payload_attributes;
+use reth_optimism_payload_builder::OpPayloadAttrs;
 use tracing::info;
 
 use world_chain_node::context::WorldChainDefaultContext;
-use world_chain_primitives::p2p::Authorization;
+use world_chain_primitives::{p2p::Authorization, payload_id::force_op_payload_id_v3};
 use world_chain_test_utils::e2e_harness::{
     actions::EngineDriver,
     setup::{TX_SET_L1_BLOCK, build_payload_attributes, encode_eip1559_params, setup},
@@ -118,13 +118,13 @@ pub async fn run(args: Args) -> Result<()> {
         None
     };
 
-    let authorization_gen = move |parent_hash: B256, attrs: OpPayloadAttributes| -> Authorization {
+    let authorization_gen = move |parent_hash: B256, attrs: OpPayloadAttrs| -> Authorization {
         let authorizer_sk = ed25519_dalek::SigningKey::from_bytes(&[0; 32]);
-        let payload_id = payload_id_optimism(&parent_hash, &attrs, 3);
+        let payload_id = force_op_payload_id_v3(attrs.payload_id(&parent_hash));
         let vk = maybe_builder_vk.unwrap_or_else(|| authorizer_sk.verifying_key());
         Authorization::new(
             payload_id,
-            PayloadAttributes::timestamp(&attrs),
+            attrs.payload_attributes.timestamp,
             &authorizer_sk,
             vk,
         )

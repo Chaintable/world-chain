@@ -4,7 +4,10 @@ use std::time::Duration;
 
 use crate::{
     engine::FlashblocksEngineApiBuilder,
-    node::{WorldChainNode, WorldChainNodeComponentBuilder, WorldChainNodeContext},
+    node::{
+        WorldChainNode, WorldChainNodeComponentBuilder, WorldChainNodeContext,
+        WorldChainNodePrimitiveTypes,
+    },
     payload::FlashblocksPayloadBuilderBuilder,
     payload_service::FlashblocksPayloadServiceBuilder,
     pool::WorldChainPoolBuilder,
@@ -12,17 +15,20 @@ use crate::{
 use ed25519_dalek::VerifyingKey;
 use hex::ToHex;
 use reth_network::protocol::IntoRlpxSubProtocol;
-use reth_node_api::{FullNodeTypes, NodeTypes};
+use reth_node_api::{FullNodeTypes, NodeTypes, TxTy};
 use reth_node_builder::{
     NodeAdapter, NodeComponentsBuilder,
     components::{ComponentsBuilder, PayloadServiceBuilder},
     rpc::{BasicEngineValidatorBuilder, RpcAddOns},
 };
+use reth_node_core::primitives::Hardforks;
+use reth_optimism_chainspec::OpChainSpec;
 use reth_optimism_evm::OpEvmConfig;
 use reth_optimism_node::{
-    OpAddOns, OpConsensusBuilder, OpEngineValidatorBuilder, OpExecutorBuilder, OpNetworkBuilder,
-    args::RollupArgs,
+    OpAddOns, OpConsensusBuilder, OpEngineTypes, OpEngineValidatorBuilder, OpExecutorBuilder,
+    OpNetworkBuilder, args::RollupArgs,
 };
+use reth_optimism_primitives::OpPrimitives;
 use reth_optimism_rpc::OpEthApiBuilder;
 use world_chain_builder::coordinator::FlashblocksExecutionCoordinator;
 use world_chain_cli::{WorldChainArgs, WorldChainNodeConfig};
@@ -41,7 +47,6 @@ use crate::tx_propagation::WorldChainTransactionPropagationPolicy;
 use reth_network::PeersInfo;
 use reth_network_peers::PeerId;
 use reth_node_builder::{BuilderContext, components::NetworkBuilder};
-use reth_primitives::Hardforks;
 use reth_transaction_pool::{PoolTransaction, TransactionPool};
 
 /// Network builder for World Chain that optionally applies custom transaction propagation policy
@@ -80,11 +85,8 @@ impl WorldChainNetworkBuilder {
 impl<Node, Pool> NetworkBuilder<Node, Pool> for WorldChainNetworkBuilder
 where
     Node: FullNodeTypes<Types: NodeTypes<ChainSpec: Hardforks>>,
-    Pool: TransactionPool<
-            Transaction: PoolTransaction<
-                Consensus = <<Node::Types as NodeTypes>::Primitives as reth_node_api::NodePrimitives>::SignedTx,
-            >,
-        > + Unpin
+    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TxTy<Node::Types>>>
+        + Unpin
         + 'static,
 {
     type Network = <OpNetworkBuilder as NetworkBuilder<Node, Pool>>::Network;
@@ -102,9 +104,10 @@ where
 
         let mut network_config = op_network_builder.network_config(ctx)?;
         let local_peer_id = network_config.hello_message.id;
-        network_config.peers_config.trusted_nodes.retain(|peer| {
-            peer.id != local_peer_id
-        });
+        network_config
+            .peers_config
+            .trusted_nodes
+            .retain(|peer| peer.id != local_peer_id);
 
         let mut trusted_peer_ids: Vec<_> = network_config
             .peers_config
@@ -171,6 +174,12 @@ pub struct WorldChainDefaultContext {
     components_context: Option<FlashblocksComponentsContext>,
 }
 
+impl WorldChainNodePrimitiveTypes for WorldChainDefaultContext {
+    type Primitives = OpPrimitives;
+    type Payload = OpEngineTypes;
+    type ChainSpec = OpChainSpec;
+}
+
 impl<N: FullNodeTypes<Types = WorldChainNode<WorldChainDefaultContext>>> WorldChainNodeContext<N>
     for WorldChainDefaultContext
 where
@@ -178,6 +187,7 @@ where
         FlashblocksPayloadBuilderBuilder<WorldChainPayloadBuilderCtxBuilder>,
     >: PayloadServiceBuilder<N, BasicWorldChainPool<N>, OpEvmConfig>,
 {
+    type Pool = BasicWorldChainPool<N>;
     type Net = WorldChainNetworkBuilder;
     type Evm = OpEvmConfig;
     type PayloadServiceBuilder = FlashblocksPayloadServiceBuilder<
@@ -339,6 +349,7 @@ where
             Default::default(),
             engine_api_builder,
             engine_validator_builder,
+            Default::default(),
             Default::default(),
         );
 

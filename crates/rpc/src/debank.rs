@@ -1,21 +1,25 @@
-use alloy_consensus::{constants::KECCAK_EMPTY, BlockHeader};
+//! Debank trace types and helpers.
+//!
+//! Ported from reth-x. Provides types and functions for the `trace_debankBlock` RPC method.
+
+use alloy_consensus::{BlockHeader, constants::KECCAK_EMPTY};
 use alloy_genesis::Genesis;
 use alloy_network::ReceiptResponse;
 use alloy_primitives::{
-    hex, keccak256, Address, BlockHash, BlockNumber, Bytes, B256 as H256, U256,
+    Address, BlockHash, BlockNumber, Bytes, B256 as H256, U256, hex, keccak256,
 };
 use alloy_rlp::{RlpDecodable, RlpEncodable};
 use alloy_rpc_types_eth::Header;
 use reth_primitives_traits::{Block, RecoveredBlock, Transaction};
 use reth_trie::EMPTY_ROOT_HASH;
+use revm::{DatabaseRef, database::BundleState, interpreter::InstructionResult};
 use revm_bytecode::opcode::OpCode;
-use revm_database::BundleAccount;
 use revm_inspectors::tracing::{
-    types::{CallKind, CallLog, CallTraceNode, TraceMemberOrder},
     CallTraceArena,
+    types::{CallKind, CallLog, CallTraceNode, TraceMemberOrder},
 };
 use serde::{Deserialize, Serialize};
-use sha1::{Digest, Sha1};
+use sha1::Digest;
 use std::str::FromStr;
 
 #[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable, Default)]
@@ -28,79 +32,32 @@ pub struct BlockStorageDiff {
     pub new_codes: Vec<NewCode>,
 }
 
-pub fn build_storage_diff_from_bundle<F>(
-    accounts: impl IntoIterator<Item = (Address, Option<BundleAccount>)>,
-    pre_code_hash_for: F,
-) -> BlockStorageDiff
-where
-    F: Fn(Address) -> Option<H256>,
-{
-    let mut new_accounts = Vec::new();
-    let mut deleted_accounts = Vec::new();
-    let mut storage_diffs = Vec::new();
-    let mut new_codes = Vec::new();
-
-    for (address, maybe_account) in accounts {
-        let Some(bundle_acc) = maybe_account else {
-            continue;
-        };
-
-        if bundle_acc.status.was_destroyed() {
-            deleted_accounts.push(keccak256(address.0));
-            continue;
-        }
-
-        if !bundle_acc.is_info_changed() && bundle_acc.storage.is_empty() {
-            continue;
-        }
-
-        let info = match &bundle_acc.info {
-            Some(i) => i,
-            None => continue,
-        };
-
-        new_accounts.push(NewAccount {
-            address: keccak256(address.0),
-            balance: info.balance,
-            nonce: info.nonce,
-            code_hash: info.code_hash,
-        });
-
-        let changed_slots: Vec<IndexValuePair> = bundle_acc
-            .storage
-            .iter()
-            .filter(|(_, slot)| slot.is_changed())
-            .map(|(key, slot)| IndexValuePair {
-                index: keccak256::<[u8; 32]>(key.to_be_bytes()),
-                value: slot.present_value,
-            })
-            .collect();
-
-        if !changed_slots.is_empty() {
-            storage_diffs
-                .push(AccountStorageDiff { address: keccak256(address.0), diffs: changed_slots });
-        }
-
-        if let Some(code) = &info.code {
-            let code_hash = info.code_hash;
-            if code_hash != KECCAK_EMPTY {
-                let pre_hash = pre_code_hash_for(address);
-                if pre_hash.map_or(true, |h| h != code_hash) {
-                    new_codes.push(NewCode { code_hash, code: code.original_bytes() });
-                }
-            }
-        }
-    }
-
-    BlockStorageDiff {
-        hash: H256::ZERO,
-        parent_hash: H256::ZERO,
-        new_accounts,
-        deleted_accounts,
-        storage_diffs,
-        new_codes,
-    }
+#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
+pub struct NewCode {
+    pub code_hash: H256,
+    pub code: Bytes,
 }
+
+#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
+pub struct NewAccount {
+    pub address: H256,
+    pub balance: U256,
+    pub nonce: u64,
+    pub code_hash: H256,
+}
+
+#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
+pub struct AccountStorageDiff {
+    pub address: H256,
+    pub diffs: Vec<IndexValuePair>,
+}
+
+#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
+pub struct IndexValuePair {
+    pub index: H256,
+    pub value: U256,
+}
+
 
 pub fn get_storage_contracts_from_genesis(genesis: &Genesis) -> Vec<Address> {
     let mut addresses = Vec::new();
@@ -112,18 +69,70 @@ pub fn get_storage_contracts_from_genesis(genesis: &Genesis) -> Vec<Address> {
     addresses
 }
 
-pub fn get_storage_contracts_from_bundle<'a>(
-    accounts: impl IntoIterator<Item = (&'a Address, &'a Option<BundleAccount>)>,
-) -> Vec<Address> {
-    let mut addresses = Vec::new();
-    for (address, maybe_account) in accounts {
-        if let Some(acc) = maybe_account {
-            if acc.storage.values().any(|s| s.is_changed()) {
-                addresses.push(*address);
+pub fn get_storage_contracts_from_bundle(bundle: &BundleState) -> Vec<Address> {
+    bundle
+        .state
+        .iter()
+        .filter_map(|(address, account)| (!account.storage.is_empty()).then_some(*address))
+        .collect()
+}
+
+pub fn get_storage_diffs_from_bundle<DB: DatabaseRef>(
+    bundle: BundleState,
+    pre_db: DB,
+) -> BlockStorageDiff {
+    let mut new_accounts = Vec::new();
+    let mut deleted_accounts = Vec::new();
+    let mut storage_diffs = Vec::new();
+    let mut new_codes = Vec::new();
+
+    for (address, account) in bundle.state {
+        let Some(info) = account.info else {
+            deleted_accounts.push(keccak256(address.0));
+            continue;
+        };
+
+        new_accounts.push(NewAccount {
+            address: keccak256(address.0),
+            balance: info.balance,
+            nonce: info.nonce,
+            code_hash: info.code_hash,
+        });
+
+        if !account.storage.is_empty() {
+            let diffs: Vec<IndexValuePair> = account
+                .storage
+                .into_iter()
+                .map(|(key, slot)| IndexValuePair {
+                    index: keccak256::<[u8; 32]>(key.to_be_bytes()),
+                    value: slot.present_value,
+                })
+                .collect();
+
+            if !diffs.is_empty() {
+                storage_diffs.push(AccountStorageDiff { address: keccak256(address.0), diffs });
             }
         }
+
+        if let Some(code) = info.code {
+            let code_hash = info.code_hash;
+            if let Ok(Some(prev)) = pre_db.basic_ref(address) {
+                if prev.code_hash == code_hash {
+                    continue;
+                }
+            }
+            new_codes.push(NewCode { code_hash, code: code.original_bytes() });
+        }
     }
-    addresses
+
+    BlockStorageDiff {
+        hash: H256::ZERO,
+        parent_hash: H256::ZERO,
+        new_accounts,
+        deleted_accounts,
+        storage_diffs,
+        new_codes,
+    }
 }
 
 impl From<&Genesis> for BlockStorageDiff {
@@ -175,36 +184,10 @@ impl From<&Genesis> for BlockStorageDiff {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
-pub struct NewCode {
-    pub code_hash: H256,
-    pub code: Bytes,
-}
-
-#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
-pub struct NewAccount {
-    pub address: H256,
-    pub balance: U256,
-    pub nonce: u64,
-    pub code_hash: H256,
-}
-
-#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
-pub struct AccountStorageDiff {
-    pub address: H256,
-    pub diffs: Vec<IndexValuePair>,
-}
-
-#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
-pub struct IndexValuePair {
-    pub index: H256,
-    pub value: U256,
-}
-
 pub fn calc_validation_hash(ids: &[String]) -> i64 {
     let mut sha1_sum = U256::from(0);
     for each in ids {
-        let mut hasher = Sha1::new();
+        let mut hasher = sha1::Sha1::new();
         hasher.update(each.as_bytes());
         let hash_int = U256::from_str_radix(&hex::encode(hasher.finalize()), 16)
             .unwrap_or_else(|_| panic!("Failed to convert id {} to U256", each));
@@ -216,7 +199,6 @@ pub fn calc_validation_hash(ids: &[String]) -> i64 {
     } else {
         &sha1_sum_str
     };
-
     i64::from_str(last_6_digits).unwrap_or(0)
 }
 
@@ -396,6 +378,7 @@ pub struct DebankOutPut {
     pub validation_hash: i64,
 }
 
+
 pub trait DebankID {
     fn debank_id(&self) -> String;
 
@@ -422,26 +405,25 @@ impl DebankID for DebankTrace {
     }
 }
 
-pub(crate) fn fmt_error_msg(res: revm_interpreter::InstructionResult) -> Option<String> {
+pub(crate) fn fmt_error_msg(res: InstructionResult) -> Option<String> {
     if res.is_ok() {
         return None;
     }
     let msg = match res {
-        revm_interpreter::InstructionResult::Revert => "Reverted".to_string(),
-        revm_interpreter::InstructionResult::OutOfGas
-        | revm_interpreter::InstructionResult::PrecompileOOG
-        | revm_interpreter::InstructionResult::MemoryOOG
-        | revm_interpreter::InstructionResult::MemoryLimitOOG
-        | revm_interpreter::InstructionResult::InvalidOperandOOG
-        | revm_interpreter::InstructionResult::ReentrancySentryOOG => "Out of gas".to_string(),
-        revm_interpreter::InstructionResult::OutOfFunds => {
-            "Insufficient balance for transfer".to_string()
+        InstructionResult::Revert => "Reverted".to_string(),
+        InstructionResult::OutOfGas
+        | InstructionResult::PrecompileOOG
+        | InstructionResult::MemoryOOG
+        | InstructionResult::MemoryLimitOOG
+        | InstructionResult::InvalidOperandOOG
+        | InstructionResult::ReentrancySentryOOG => "Out of gas".to_string(),
+        InstructionResult::OutOfFunds => "Insufficient balance for transfer".to_string(),
+        InstructionResult::OpcodeNotFound | InstructionResult::InvalidFEOpcode => {
+            "Bad instruction".to_string()
         }
-        revm_interpreter::InstructionResult::OpcodeNotFound
-        | revm_interpreter::InstructionResult::InvalidFEOpcode => "Bad instruction".to_string(),
-        revm_interpreter::InstructionResult::StackOverflow => "Out of stack".to_string(),
-        revm_interpreter::InstructionResult::InvalidJump => "Bad jump destination".to_string(),
-        revm_interpreter::InstructionResult::PrecompileError => "Built-in failed".to_string(),
+        InstructionResult::StackOverflow => "Out of stack".to_string(),
+        InstructionResult::InvalidJump => "Bad jump destination".to_string(),
+        InstructionResult::PrecompileError => "Built-in failed".to_string(),
         status => format!("{status:?}"),
     };
     Some(msg)
@@ -492,13 +474,13 @@ impl From<&CallTraceNode> for DebankTrace {
 
 impl From<&CallLog> for DebankEvent {
     fn from(log: &CallLog) -> Self {
-        let selector = log.raw_log.topics().first().map(|h| h.to_string()).unwrap_or_default();
+        let selector =
+            log.raw_log.topics().first().map(|h| h.to_string()).unwrap_or_default();
         let topics = if log.raw_log.topics().len() > 1 {
             log.raw_log.topics()[1..].iter().map(|h| h.to_string()).collect()
         } else {
             vec![]
         };
-
         DebankEvent { selector, topics, data: log.raw_log.data.clone(), ..Default::default() }
     }
 }
@@ -514,6 +496,7 @@ struct DebankTraceNode {
     success: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_trace_node(
     tx_id: String,
     parent_trace_id: String,
@@ -577,6 +560,8 @@ fn build_trace_node(
         }
     }
 
+    // selfdestructs are not recorded as individual call traces but are derived from
+    // the call trace and are added as additional `TransactionTrace` objects
     if node.is_selfdestruct() {
         child_trace_address.last_mut().map(|last| *last += 1);
         debank_node.trace.subtraces += 1;
@@ -658,6 +643,7 @@ pub fn build_debank_traces(
     (traces, error_traces, events, error_events)
 }
 
+/// Build genesis transactions and traces from genesis alloc.
 pub fn build_genesis_txs_and_traces(
     genesis: &Genesis,
 ) -> (Vec<DebankTransaction>, Vec<DebankTrace>) {
@@ -679,10 +665,16 @@ pub fn build_genesis_txs_and_traces(
                 id: tx_id.clone(),
                 from: zero_addr,
                 to: *addr,
+                gas_limit: 0,
+                gas_price: 0,
+                gas_used: 0,
+                status: true,
+                gas_fee_cap: 0,
+                gas_tip_cap: 0,
+                input: Bytes::default(),
+                nonce: 0,
                 transaction_index: tx_idx,
                 value: account.balance,
-                status: true,
-                ..Default::default()
             };
             txs.push(tx);
 
@@ -690,12 +682,22 @@ pub fn build_genesis_txs_and_traces(
             let trace = DebankTrace {
                 id: trace_id,
                 from_addr: zero_addr,
+                gas_limit: 0,
+                input: Bytes::default(),
                 to_addr: *addr,
                 value: account.balance,
-                tx_id,
+                gas_used: 0,
+                output: Bytes::default(),
                 call_create_type: "call".to_string(),
                 call_type: "call".to_string(),
-                ..Default::default()
+                tx_id,
+                parent_trace_id: "".to_string(),
+                pos_in_parent_trace: 0,
+                self_storage_change: false,
+                storage_change: false,
+                subtraces: 0,
+                trace_address: vec![],
+                error: "".to_string(),
             };
             traces.push(trace);
             tx_idx += 1;
@@ -708,10 +710,16 @@ pub fn build_genesis_txs_and_traces(
                     id: tx_id.clone(),
                     from: zero_addr,
                     to: *addr,
-                    input: code.clone(),
-                    transaction_index: tx_idx,
+                    gas_limit: 0,
+                    gas_price: 0,
+                    gas_used: 0,
                     status: true,
-                    ..Default::default()
+                    gas_fee_cap: 0,
+                    gas_tip_cap: 0,
+                    input: code.clone(),
+                    nonce: 0,
+                    transaction_index: tx_idx,
+                    value: U256::ZERO,
                 };
                 txs.push(tx);
 
@@ -719,12 +727,22 @@ pub fn build_genesis_txs_and_traces(
                 let trace = DebankTrace {
                     id: trace_id,
                     from_addr: zero_addr,
-                    to_addr: *addr,
+                    gas_limit: 0,
                     input: code.clone(),
+                    to_addr: *addr,
+                    value: U256::ZERO,
+                    gas_used: 0,
                     output: code.clone(),
-                    tx_id,
                     call_create_type: "create".to_string(),
-                    ..Default::default()
+                    call_type: "".to_string(),
+                    tx_id,
+                    parent_trace_id: "".to_string(),
+                    pos_in_parent_trace: 0,
+                    self_storage_change: false,
+                    storage_change: false,
+                    subtraces: 0,
+                    trace_address: vec![],
+                    error: "".to_string(),
                 };
                 traces.push(trace);
                 tx_idx += 1;
@@ -732,30 +750,50 @@ pub fn build_genesis_txs_and_traces(
         }
     }
 
+    // Native token contract (0xeeee...eeee)
     let native_token_addr =
         Address::from_str("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap();
     let native_token_addr_lower = format!("{:?}", native_token_addr).to_lowercase();
     let native_token_tx_id = format!("0xgenesis03{:013}{}", 0, native_token_addr_lower);
-    let native_token_tx = DebankTransaction {
+
+    txs.push(DebankTransaction {
         id: native_token_tx_id.clone(),
         from: zero_addr,
         to: native_token_addr,
-        transaction_index: tx_idx,
+        gas_limit: 0,
+        gas_price: 0,
+        gas_used: 0,
         status: true,
-        ..Default::default()
-    };
-    txs.push(native_token_tx);
+        gas_fee_cap: 0,
+        gas_tip_cap: 0,
+        input: Bytes::default(),
+        nonce: 0,
+        transaction_index: tx_idx,
+        value: U256::ZERO,
+    });
 
-    let native_token_trace_id = DebankTrace::calculate_id(vec![&native_token_tx_id, "", "0"]);
-    let native_token_trace = DebankTrace {
+    let native_token_trace_id =
+        DebankTrace::calculate_id(vec![&native_token_tx_id, "", "0"]);
+    traces.push(DebankTrace {
         id: native_token_trace_id,
         from_addr: zero_addr,
+        gas_limit: 0,
+        input: Bytes::default(),
         to_addr: native_token_addr,
-        tx_id: native_token_tx_id,
+        value: U256::ZERO,
+        gas_used: 0,
+        output: Bytes::default(),
         call_create_type: "create".to_string(),
-        ..Default::default()
-    };
-    traces.push(native_token_trace);
+        call_type: "".to_string(),
+        tx_id: native_token_tx_id,
+        parent_trace_id: "".to_string(),
+        pos_in_parent_trace: 0,
+        self_storage_change: false,
+        storage_change: false,
+        subtraces: 0,
+        trace_address: vec![],
+        error: "".to_string(),
+    });
 
     (txs, traces)
 }
