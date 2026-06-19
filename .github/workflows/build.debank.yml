@@ -11,9 +11,9 @@ on:
   workflow_dispatch:
 
 env:
-  AWS_REGION: ap-northeast-1
-  REGISTRY: 294354037686.dkr.ecr.ap-northeast-1.amazonaws.com
-  IMAGE: blockchain-world-x
+  AWS_REGION: us-east-1
+  REGISTRY: public.ecr.aws/b2h7a5c4/chaintable
+  IMAGE: world-chain-writer
   DOCKERFILE: Dockerfile
 
 jobs:
@@ -22,6 +22,9 @@ jobs:
       matrix:
         arch: [ amd64, arm64 ]
     runs-on: [self-hosted, "${{ matrix.arch }}"]
+    permissions:
+      contents: read
+      id-token: write
     steps:
 
       - name: Checkout code
@@ -43,13 +46,16 @@ jobs:
             echo "REVISION=$(git rev-parse --short=7 HEAD)" >> $GITHUB_ENV
           fi
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v1
+        uses: aws-actions/configure-aws-credentials@v4
         with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: public
 
       - name: Build and push image
         uses: docker/build-push-action@v5
@@ -65,6 +71,9 @@ jobs:
   merge-docker-manifest:
     runs-on: [ self-hosted, general ]
     needs: build-artifacts
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -79,21 +88,24 @@ jobs:
             echo "REVISION=$(git rev-parse --short=7 HEAD)" >> $GITHUB_ENV
           fi
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v1
+        uses: aws-actions/configure-aws-credentials@v4
         with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: public
 
       - name: Merge manifest
         run: |
-          docker pull --platform=linux/amd64 ${REGISTRY}/${IMAGE}:amd64-${REVISION}
-          docker pull --platform=linux/arm64 ${REGISTRY}/${IMAGE}:arm64-${REVISION}
-          docker buildx imagetools create --tag ${REGISTRY}/${IMAGE}:${REVISION} ${REGISTRY}/${IMAGE}:amd64-${REVISION} ${REGISTRY}/${IMAGE}:arm64-${REVISION}
-          docker rmi ${REGISTRY}/${IMAGE}:amd64-${REVISION}
-          docker rmi ${REGISTRY}/${IMAGE}:arm64-${REVISION}
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            docker buildx imagetools create --tag ${REGISTRY}/${IMAGE}:${REVISION} --tag ${REGISTRY}/${IMAGE}:latest ${REGISTRY}/${IMAGE}:amd64-${REVISION} ${REGISTRY}/${IMAGE}:arm64-${REVISION}
+          else
+            docker buildx imagetools create --tag ${REGISTRY}/${IMAGE}:${REVISION} ${REGISTRY}/${IMAGE}:amd64-${REVISION} ${REGISTRY}/${IMAGE}:arm64-${REVISION}
+          fi
       - name: Lark Notification
         continue-on-error: true
         run: |
