@@ -42,13 +42,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Generate app token
-        id: generate-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.RELEASE_MANAGER_APP_ID }}
-          private-key: ${{ secrets.RELEASE_MANAGER_APP_SECRET }}
-
       - name: Set revision
         run: echo "REVISION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
 
@@ -74,7 +67,6 @@ jobs:
           platforms: ${{ matrix.platform }}
           push: true
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.REVISION }}-${{ matrix.arch }}
-          build-args: GITHUB_TOKEN=${{ steps.generate-token.outputs.token }}
           cache-from: type=gha,scope=build-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=build-${{ matrix.arch }}
           provenance: false
