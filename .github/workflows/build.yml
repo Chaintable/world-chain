@@ -2,9 +2,9 @@ name: build
 
 on:
   pull_request:
-    branches: [debank]
+    branches: [main]
   push:
-    branches: [debank]
+    branches: [main]
   workflow_dispatch:
 
 env:
