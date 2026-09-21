@@ -60,6 +60,8 @@ jobs:
           context: .
           file: ${{ env.DOCKERFILE }}
           platforms: ${{ matrix.platform }}
+          build-args: |
+            VERGEN_GIT_SHA=${{ github.sha }}
           push: true
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.REVISION }}-${{ matrix.arch }}
           cache-from: type=gha,scope=build-${{ matrix.arch }}
