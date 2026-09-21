@@ -1,9 +1,10 @@
-name: release
+name: build
 
 on:
-  release:
-    types:
-      - created
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -37,7 +38,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set revision
-        run: echo "REVISION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
+        run: echo "REVISION=$(git rev-parse --short=8 HEAD)" >> $GITHUB_ENV
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -78,7 +79,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set revision
-        run: echo "REVISION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
+        run: echo "REVISION=$(git rev-parse --short=8 HEAD)" >> $GITHUB_ENV
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -94,13 +95,9 @@ jobs:
         with:
           registry-type: public
 
-      # release（非 prerelease）才打 latest；tag push / workflow_dispatch 只打 revision
       - name: Create and push multi-arch manifest
         run: |
-          TAGS="-t ${REGISTRY}/${IMAGE_NAME}:${REVISION}"
-          if [[ "${{ github.event_name }}" == "release" && "${{ github.event.release.prerelease }}" != "true" ]]; then
-            TAGS="$TAGS -t ${REGISTRY}/${IMAGE_NAME}:latest"
-          fi
-          docker buildx imagetools create $TAGS \
+          docker buildx imagetools create \
+            -t ${REGISTRY}/${IMAGE_NAME}:${REVISION} \
             ${REGISTRY}/${IMAGE_NAME}:${REVISION}-amd64 \
             ${REGISTRY}/${IMAGE_NAME}:${REVISION}-arm64

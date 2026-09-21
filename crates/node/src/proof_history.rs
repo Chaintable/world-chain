@@ -22,6 +22,7 @@ use tokio::time::sleep;
 use tracing::info;
 use world_chain_chainspec::WorldChainSpec;
 use world_chain_cli::WorldChainNodeConfig;
+use world_chain_rpc::{DebankTraceApi, TraceApiServer};
 
 /// Launches a World Chain node, enabling proof history when requested by
 /// `--proofs-history`.
@@ -32,6 +33,12 @@ pub async fn launch_node(
     if !config.args.rollup.proofs_history {
         let handle = builder
             .node(WorldChainNode::<WorldChainDefaultContext>::new(config))
+            .extend_rpc_modules(|ctx| {
+                ctx.modules.merge_configured(
+                    DebankTraceApi::new(ctx.registry.eth_api().clone()).into_rpc(),
+                )?;
+                Ok(())
+            })
             .launch()
             .await?;
         return handle.node_exit_future.await;
@@ -99,6 +106,10 @@ where
                 .boxed())
         })
         .extend_rpc_modules(move |ctx| {
+            ctx.modules.merge_configured(
+                DebankTraceApi::new(ctx.registry.eth_api().clone()).into_rpc(),
+            )?;
+
             info!(target: "reth::cli", "Installing proofs-history RPC overrides (eth_getProof, debug_executePayload)");
 
             let eth_api = EthApiExt::new(ctx.registry.eth_api().clone(), proofs_storage.clone());

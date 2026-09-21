@@ -7559,6 +7559,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "md5"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -19471,19 +19477,27 @@ dependencies = [
  "alloy",
  "alloy-consensus 2.1.1",
  "alloy-eips 2.1.1",
+ "alloy-genesis",
+ "alloy-network 2.1.1",
  "alloy-op-evm",
  "alloy-primitives",
  "alloy-provider",
+ "alloy-rlp",
  "alloy-rpc-types",
  "alloy-rpc-types-debug",
  "alloy-rpc-types-engine",
+ "alloy-rpc-types-eth 2.1.1",
  "alloy-sol-types",
+ "async-trait",
  "color-eyre",
+ "futures",
  "hex",
  "jsonrpsee",
  "jsonrpsee-core",
  "jsonrpsee-types",
  "lru 0.18.2",
+ "md5",
+ "op-alloy-consensus",
  "op-alloy-network",
  "op-alloy-rpc-types",
  "op-alloy-rpc-types-engine",
@@ -19509,12 +19523,16 @@ dependencies = [
  "reth-tasks",
  "reth-tracing",
  "reth-transaction-pool",
+ "reth-trie",
  "revm",
+ "revm-bytecode",
  "revm-database",
  "revm-database-interface",
+ "revm-inspectors",
  "revm-primitives",
  "serde",
  "serde_json",
+ "sha1 0.10.7",
  "thiserror 2.0.19",
  "tokio",
  "tracing",

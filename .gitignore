@@ -22,3 +22,4 @@ pkg/contracts/sepolia_load_test.json
 # nix build output symlinks
 /result
 /result-*
+.idea

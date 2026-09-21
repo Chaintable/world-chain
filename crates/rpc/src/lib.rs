@@ -27,3 +27,7 @@ pub mod simulate_consts;
 
 pub mod witness;
 pub use witness::{DebugWitnessOracle, DebugWitnessOracleApiServer};
+
+pub mod debank;
+pub mod trace;
+pub use trace::{DebankTraceApi, TraceApiServer};
