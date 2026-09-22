@@ -1,21 +1,18 @@
 use alloy_consensus::BlockHeader;
-use alloy_eips::eip2930::AccessList;
 use alloy_network::{Ethereum, EthereumWallet, NetworkTransactionBuilder, eip2718::Encodable2718};
 use alloy_primitives::{Bytes, b64};
 use alloy_provider::ProviderBuilder;
 use alloy_rpc_types::TransactionRequest;
 use alloy_rpc_types_engine::PayloadStatusEnum;
-use alloy_signer::SignerSync;
 use eyre::eyre::eyre;
 use op_alloy_consensus::OpTxEnvelope;
 use reth_chainspec::EthChainSpec;
 use reth_e2e_test_utils::testsuite::actions::Action;
 use reth_network::{NetworkSyncUpdater, SyncState};
 use reth_node_api::PayloadAttributes;
-use reth_optimism_node::utils::optimism_payload_attributes;
 use reth_tasks::Runtime;
 use reth_transaction_pool::TransactionPool;
-use revm_primitives::{Address, B256, TxKind, U256};
+use revm_primitives::{Address, B256, U256};
 use std::{
     sync::{
         Arc,
@@ -36,11 +33,15 @@ use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_client::RpcClient;
 use alloy_rpc_types_engine::PayloadId;
 use ed25519_dalek::SigningKey;
+use proptest::{
+    strategy::{Strategy, ValueTree},
+    test_runner::TestRunner,
+};
 use reth_network::{Peers, PeersInfo};
 use reth_network_peers::PeerId;
 use reth_tracing::tracing_subscriber::{self, util::SubscriberInitExt};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     io::Write,
     time::{SystemTime, UNIX_EPOCH},
@@ -61,13 +62,10 @@ use world_chain_primitives::{
     },
     payload_id::force_op_payload_id_v3,
     primitives::{ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1, FlashblocksPayloadV1},
-    transaction::{SignedWip1001, TxWip1001, Wip1001Signature, WorldChainTxEnvelope},
 };
 use world_chain_test_utils::{
-    Wip1001NodeContext,
     e2e_harness::setup::{
-        CHAIN_SPEC, create_test_transaction, encode_eip1559_params, setup,
-        setup_with_block_uncompressed_size_limit, setup_with_tx_peers,
+        CHAIN_SPEC, WorldChainTestBuilder, create_test_transaction, encode_eip1559_params,
     },
     utils::{eip1559, raw_tx},
 };
@@ -98,68 +96,15 @@ async fn create_priority_transaction(
     Ok((signed.encoded_2718().into(), *signed.tx_hash()))
 }
 
-fn create_wip1001_transaction() -> eyre::Result<(Bytes, B256)> {
-    let session_signer = signer(0);
-    let session_key = session_signer
-        .credential()
-        .verifying_key()
-        .to_encoded_point(true);
-
-    let tx = TxWip1001 {
-        chain_id: CHAIN_SPEC.chain.id(),
-        nonce: 0,
-        max_priority_fee_per_gas: 1_000_000_000,
-        max_fee_per_gas: 2_000_000_000,
-        gas_limit: 21_000,
-        to: TxKind::Call(Address::default()),
-        value: U256::from(1),
-        input: Bytes::new(),
-        access_list: AccessList::default(),
-        world_id_account: account(0),
-        signature_type: Wip1001Signature::SECP256K1_TYPE,
-        session_key: Bytes::copy_from_slice(session_key.as_bytes()),
-    };
-
-    let signature = session_signer.sign_hash_sync(&tx.signing_hash())?;
-    let envelope = WorldChainTxEnvelope::from(SignedWip1001::new_signed(
-        tx,
-        Wip1001Signature::Secp256k1(signature),
-    ));
-    let tx_hash = envelope.tx_hash();
-
-    Ok((envelope.encoded_2718().into(), tx_hash))
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_wip1001_node_accepts_wip1001_transaction() -> eyre::Result<()> {
-    reth_tracing::init_test_tracing();
-
-    let (_, mut nodes, _tasks, _, _) =
-        setup::<Wip1001NodeContext>(1, optimism_payload_attributes, false).await?;
-    let node = &mut nodes[0].node;
-
-    let (raw_tx, tx_hash) = create_wip1001_transaction()?;
-    assert_eq!(node.rpc.inject_tx(raw_tx).await?, tx_hash);
-
-    let payload = node.advance_block().await?;
-    assert!(
-        payload
-            .block()
-            .body()
-            .transactions
-            .iter()
-            .any(|tx| tx.hash() == &tx_hash),
-        "WIP-1001 transaction should be included"
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_can_build_pbh_payload() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
-    let (signers, mut nodes, _tasks, _, _) =
-        setup::<WorldChainDefaultContext>(1, optimism_payload_attributes, false).await?;
+    let (signers, mut nodes, _tasks, _, _) = WorldChainTestBuilder::builder()
+        .nodes(1)
+        .flashblocks(false)
+        .build()
+        .setup::<WorldChainDefaultContext>()
+        .await?;
     let node = &mut nodes[0].node;
     let mut pbh_tx_hashes = vec![];
     let signers = signers.clone();
@@ -185,12 +130,16 @@ async fn test_can_build_pbh_payload() -> eyre::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_transaction_pool_ordering() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let (signers, mut nodes, _tasks, _, _) =
-        setup::<WorldChainDefaultContext>(1, optimism_payload_attributes, false).await?;
+    let (signers, mut nodes, _tasks, _, _) = WorldChainTestBuilder::builder()
+        .nodes(1)
+        .flashblocks(false)
+        .build()
+        .setup::<WorldChainDefaultContext>()
+        .await?;
     let node = &mut nodes[0].node;
 
     let non_pbh_tx = tx(CHAIN_SPEC.chain.id(), None, 0, Address::default(), 210_000);
@@ -233,7 +182,7 @@ async fn test_transaction_pool_ordering() -> eyre::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_enforces_block_uncompressed_size_limit() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
@@ -245,14 +194,11 @@ async fn test_enforces_block_uncompressed_size_limit() -> eyre::Result<()> {
     let block_uncompressed_size_limit =
         TX_SET_L1_BLOCK.len() as u64 + tx1.len() as u64 + tx_small.len() as u64;
 
-    let (_, mut nodes, _tasks, _, _) =
-        setup_with_block_uncompressed_size_limit::<WorldChainDefaultContext>(
-            1,
-            optimism_payload_attributes,
-            false,
-            Some(block_uncompressed_size_limit),
-            Arc::new(CHAIN_SPEC.clone()),
-        )
+    let (_, mut nodes, _tasks, _, _) = WorldChainTestBuilder::builder()
+        .nodes(1)
+        .block_uncompressed_size_limit(block_uncompressed_size_limit)
+        .build()
+        .setup::<WorldChainDefaultContext>()
         .await?;
     let node = &mut nodes[0].node;
 
@@ -333,13 +279,17 @@ async fn test_enforces_block_uncompressed_size_limit() -> eyre::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_without_block_uncompressed_size_limit_includes_all_transactions() -> eyre::Result<()>
 {
     reth_tracing::init_test_tracing();
 
-    let (_, mut nodes, _tasks, _, _) =
-        setup::<WorldChainDefaultContext>(1, optimism_payload_attributes, false).await?;
+    let (_, mut nodes, _tasks, _, _) = WorldChainTestBuilder::builder()
+        .nodes(1)
+        .flashblocks(false)
+        .build()
+        .setup::<WorldChainDefaultContext>()
+        .await?;
     let node = &mut nodes[0].node;
 
     let (tx1, tx1_hash) = create_priority_transaction(0, 0, 50_000, 600_000, 100).await?;
@@ -382,11 +332,254 @@ async fn test_without_block_uncompressed_size_limit_includes_all_transactions() 
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+/// Sign a transaction that burns real gas via non-zero calldata, carrying an explicit `gas_limit`.
+///
+/// Under Prague (EIP-7623, active at Karst) every non-zero calldata byte costs a flat 40 gas, so
+/// `calldata_len` deterministically dials the transaction's *actual* (pre-refund) gas consumption,
+/// while `gas_limit` is what the builder reserves against the block limit. Accumulating real gas is
+/// what makes the reservation gate in `WorldChainPayloadBuilderCtx::execute_best_transactions`
+/// actually engage — a plain transfer (21k) never grows `cumulative_evm_gas_used` enough to matter.
+async fn signed_gas_burner(
+    signer_index: u32,
+    nonce: u64,
+    calldata_len: usize,
+    gas_limit: u64,
+) -> eyre::Result<(Bytes, B256)> {
+    let mut tx_request = tx(
+        CHAIN_SPEC.chain.id(),
+        Some(Bytes::from(vec![1u8; calldata_len])),
+        nonce,
+        Address::random(),
+        gas_limit,
+    );
+    tx_request.value = Some(U256::from(1));
+    // Keep the fuzzed gas limits below the node's 1 ETH transaction fee cap.
+    tx_request.max_fee_per_gas = Some(100_000_000_000);
+    tx_request.max_priority_fee_per_gas = Some(100_000_000_000);
+
+    let wallet = EthereumWallet::from(signer(signer_index));
+    let signed =
+        <TransactionRequest as NetworkTransactionBuilder<Ethereum>>::build(tx_request, &wallet)
+            .await?;
+
+    Ok((signed.encoded_2718().into(), *signed.tx_hash()))
+}
+
+/// Fuzz transaction gas through the real `WorldChainPayloadBuilder` / `WorldChainPayloadBuilderCtx`
+/// payload-building path **with flashblocks enabled**, deliberately overcommitting a block so the
+/// gas-limit overflow is caught at *validation* time (the reservation gate) rather than surfacing
+/// during the critical execution path.
+///
+/// The validator-side prop tests in `crate::fuzz` fuzz gas limits against the parallel BAL execution
+/// strategy. This is the producer-side counterpart: it drives gas-heavy transactions through the
+/// flashblocks builder via [`EngineDriver`], so `execute_best_transactions`' reservation logic is
+/// stressed *across* the chained flashblocks that make up each block (the continuation-build
+/// accounting that carries `cumulative_evm_gas_used` forward — the focus of this branch's fix).
+///
+/// Each transaction burns a fuzzed amount of real gas via non-zero calldata and carries a fuzzed,
+/// over-provisioned `gas_limit`. The total real gas injected far exceeds one block, forcing the
+/// builder to stop including transactions before the block overflows. Invariants:
+///
+/// 1. **Caps at validation, never overflows** – every built block reports `gas_used <= gas_limit`.
+///    The builder must reject the over-the-limit transaction at the `is_tx_over_limits` gate, not by
+///    failing mid-execution.
+/// 2. **Validator accepts every block** – the driver canonicalizes each block via `newPayload`; a
+///    block that overflowed (or a builder that mis-accounted gas) would be rejected there. Reaching
+///    the end means the builder produced only valid blocks.
+/// 3. **The gate actually engaged** – the load spills across multiple blocks and at least one block
+///    fills close to the limit, proving the overflow path was exercised rather than trivially fitting.
+/// 4. **No transaction is wrongly dropped** – deferred transactions drain over subsequent blocks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_payload_builder_fuzzed_gas_limits_flashblocks() -> eyre::Result<()> {
+    use std::sync::Mutex;
+
+    reth_tracing::init_test_tracing();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Constrain the built block to the genesis gas limit (30M, an unchanged value FCU accepts) so a
+    // modest number of gas-heavy transactions overcommits it and forces the reservation gate to fire.
+    const BLOCK_GAS_LIMIT: u64 = 30_000_000;
+    // Distinct funded senders (res/genesis.json funds 20 test-mnemonic accounts); signer 0 is skipped
+    // because the e2e chain spec funds it with only 0.1 ETH. Each sends one nonce-0 transaction.
+    const SENDERS: u32 = 12;
+    // Cycles to fully drain the overcommitted load.
+    const NUM_BLOCKS: usize = 5;
+    const BLOCK_INTERVAL: Duration = Duration::from_millis(2000);
+
+    let (_, nodes, _tasks, mut env, _spammer) = WorldChainTestBuilder::builder()
+        .nodes(1)
+        .flashblocks(true)
+        .build()
+        .setup::<WorldChainDefaultContext>()
+        .await?;
+
+    let builder_context = nodes[0].ext_context.clone().unwrap();
+    let block_hash = nodes[0].node.block_hash(0);
+    let chain_spec = nodes[0].node.inner.chain_spec().clone();
+
+    for node in &nodes {
+        node.node.update_forkchoice(block_hash, block_hash).await?;
+    }
+
+    // Deterministic runner so a failure reproduces from the same seed.
+    let mut runner = TestRunner::deterministic();
+    // Fuzz the real gas burned (via calldata length) and the over-provisioned headroom independently.
+    // At 40 gas/non-zero-byte each tx burns ~3.2M–4.4M real gas, so SENDERS of them (~46M) overcommit
+    // the 30M block; declared gas_limit always covers the floor cost (21k + 40*len) and stays below
+    // the block limit so the pool accepts every tx.
+    let calldata_len_strategy = 80_000usize..=110_000usize;
+    let headroom_strategy = 0u64..=3_000_000u64;
+
+    let mut injected: HashSet<Bytes> = HashSet::new();
+    for signer_index in 1..=SENDERS {
+        let calldata_len = calldata_len_strategy
+            .new_tree(&mut runner)
+            .expect("calldata strategy should produce a value")
+            .current();
+        let headroom = headroom_strategy
+            .new_tree(&mut runner)
+            .expect("headroom strategy should produce a value")
+            .current();
+        // Floor cost (21k + 40*len) plus slack, plus fuzzed over-provisioning.
+        let gas_limit = 40 * calldata_len as u64 + 100_000 + headroom;
+        let (raw, _hash) = signed_gas_burner(signer_index, 0, calldata_len, gas_limit).await?;
+        nodes[0].node.rpc.inject_tx(raw.clone()).await?;
+        injected.insert(raw);
+    }
+
+    let injected = Arc::new(injected);
+    // Every user tx observed across all built blocks.
+    let included: Arc<Mutex<HashSet<Bytes>>> = Arc::new(Mutex::new(HashSet::new()));
+    // Per-block (gas_used, gas_limit, user_tx_count).
+    let stats: Arc<Mutex<Vec<(u64, u64, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let builder_vk = builder_context
+        .flashblocks_handle
+        .builder_sk()
+        .unwrap()
+        .verifying_key();
+
+    let authorization_gen =
+        move |parent_hash: B256, attrs: reth_optimism_payload_builder::OpPayloadAttrs| {
+            let authorizer_sk = ed25519_dalek::SigningKey::from_bytes(&[0; 32]);
+            let payload_id = force_op_payload_id_v3(attrs.payload_id(&parent_hash));
+            world_chain_primitives::p2p::Authorization::new(
+                payload_id,
+                attrs.payload_attributes.timestamp,
+                &authorizer_sk,
+                builder_vk,
+            )
+        };
+
+    let mut driver = world_chain_test_utils::e2e_harness::actions::EngineDriver {
+        builder_idx: 0,
+        follower_idxs: vec![],
+        initial_parent_hash: Some(block_hash),
+        num_blocks: NUM_BLOCKS,
+        block_interval: BLOCK_INTERVAL,
+        flashblocks: true,
+        authorization_gen,
+        attributes_gen: Box::new({
+            let chain_spec = chain_spec.clone();
+            move |_block_number, timestamp| {
+                let eip1559 = encode_eip1559_params(chain_spec.as_ref(), timestamp)?;
+                let mut attrs = build_payload_attributes(
+                    timestamp,
+                    eip1559,
+                    Some(vec![TX_SET_L1_BLOCK.clone()]),
+                );
+                attrs.0.gas_limit = Some(BLOCK_GAS_LIMIT);
+                Ok(attrs)
+            }
+        }),
+        during_build: None,
+        on_block: Some(Box::new({
+            let injected = injected.clone();
+            let included = included.clone();
+            let stats = stats.clone();
+            move |_block_num, payload| {
+                let injected = injected.clone();
+                let included = included.clone();
+                let stats = stats.clone();
+
+                let inner = &payload
+                    .execution_payload
+                    .payload_inner
+                    .payload_inner
+                    .payload_inner;
+                let gas_used = inner.gas_used;
+                let gas_limit = inner.gas_limit;
+                let transactions = inner.transactions.clone();
+
+                Box::pin(async move {
+                    let mut included = included.lock().unwrap();
+                    let mut user_txs = 0;
+                    for raw in &transactions {
+                        if injected.contains(raw) {
+                            included.insert(raw.clone());
+                            user_txs += 1;
+                        }
+                    }
+                    stats.lock().unwrap().push((gas_used, gas_limit, user_txs));
+                    Ok(())
+                })
+            }
+        })),
+    };
+
+    driver.execute(&mut env).await?;
+
+    let stats = stats.lock().unwrap();
+
+    // Invariant 1: the builder caps every block at its gas limit. A correct reservation gate stops
+    // including transactions *before* the block overflows; it never produces gas_used > gas_limit.
+    for (i, (gas_used, gas_limit, _)) in stats.iter().enumerate() {
+        assert!(
+            gas_used <= gas_limit,
+            "block {i}: gas_used {gas_used} exceeds gas_limit {gas_limit}",
+        );
+    }
+
+    // Invariant 2: the driver canonicalized every block via newPayload, so reaching here means the
+    // validator accepted each block — an overflow would have surfaced as an Invalid status, i.e. it
+    // is caught at validation time rather than crashing the critical execution path.
+
+    // Invariant 3: the fuzzed load genuinely overcommitted a single block, so the gate had to defer
+    // transactions across blocks and at least one block filled close to the limit.
+    let block_gas_limit = stats.first().map(|(_, l, _)| *l).unwrap_or(BLOCK_GAS_LIMIT);
+    let blocks_with_user_txs = stats.iter().filter(|(_, _, n)| *n > 0).count();
+    assert!(
+        blocks_with_user_txs >= 2,
+        "expected the overcommitted load to spill across >= 2 blocks, got {blocks_with_user_txs}",
+    );
+    let max_gas_used = stats.iter().map(|(g, _, _)| *g).max().unwrap_or(0);
+    assert!(
+        max_gas_used > block_gas_limit / 2,
+        "expected at least one block to fill past half its gas limit; max gas_used was {max_gas_used} of {block_gas_limit}",
+    );
+
+    // Invariant 4: deferred transactions are never dropped — they all drain across the driven blocks.
+    let included = included.lock().unwrap();
+    assert_eq!(
+        included.len(),
+        injected.len(),
+        "{} of {} fuzzed transactions were never included across {NUM_BLOCKS} blocks",
+        injected.len() - included.len(),
+        injected.len(),
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_invalidate_dup_tx_and_nullifier() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
-    let (_signers, mut nodes, _tasks, _, _) =
-        setup::<WorldChainDefaultContext>(1, optimism_payload_attributes, false).await?;
+    let (_signers, mut nodes, _tasks, _, _) = WorldChainTestBuilder::builder()
+        .nodes(1)
+        .flashblocks(false)
+        .build()
+        .setup::<WorldChainDefaultContext>()
+        .await?;
     let node = &mut nodes[0].node;
     let signer = 0;
     let raw_tx = raw_pbh_bundle_bytes(signer, 0, 0, U256::ZERO, CHAIN_SPEC.chain_id()).await;
@@ -396,12 +589,16 @@ async fn test_invalidate_dup_tx_and_nullifier() -> eyre::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_dup_pbh_nonce() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let (_signers, mut nodes, _tasks, _, _) =
-        setup::<WorldChainDefaultContext>(1, optimism_payload_attributes, false).await?;
+    let (_signers, mut nodes, _tasks, _, _) = WorldChainTestBuilder::builder()
+        .nodes(1)
+        .flashblocks(false)
+        .build()
+        .setup::<WorldChainDefaultContext>()
+        .await?;
     let node = &mut nodes[0].node;
     let signer = 0;
 
@@ -423,7 +620,7 @@ async fn test_dup_pbh_nonce() -> eyre::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_flashblocks() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
@@ -432,19 +629,19 @@ async fn test_flashblocks() -> eyre::Result<()> {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Builder and Follower
-    let (_, mut nodes, _tasks, mut flashblocks_env, tx_spammer) =
-        setup::<WorldChainDefaultContext>(2, optimism_payload_attributes, true).await?;
+    let (_, mut nodes, _tasks, mut flashblocks_env, tx_spammer) = WorldChainTestBuilder::builder()
+        .nodes(2)
+        .flashblocks(true)
+        .build()
+        .setup::<WorldChainDefaultContext>()
+        .await?;
 
     // Verifier
-    let (_, basic_nodes, _tasks, mut basic_env, _) =
-        setup_with_tx_peers::<WorldChainDefaultContext>(
-            1,
-            optimism_payload_attributes,
-            false,
-            false,
-            true,
-            Arc::new(CHAIN_SPEC.clone()),
-        )
+    let (_, basic_nodes, _tasks, mut basic_env, _) = WorldChainTestBuilder::builder()
+        .nodes(1)
+        .flashblocks(true)
+        .build()
+        .setup::<WorldChainDefaultContext>()
         .await?;
 
     let basic_worldchain_node = &basic_nodes[0];
@@ -552,12 +749,16 @@ async fn test_flashblocks() -> eyre::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_eth_api_receipt() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let (_, nodes, _tasks, mut env, _spammer) =
-        setup::<WorldChainDefaultContext>(3, optimism_payload_attributes, true).await?;
+    let (_, nodes, _tasks, mut env, _spammer) = WorldChainTestBuilder::builder()
+        .nodes(3)
+        .flashblocks(true)
+        .build()
+        .setup::<WorldChainDefaultContext>()
+        .await?;
 
     let ext_context = nodes[0].ext_context.clone();
     let block_hash = nodes[0].node.block_hash(0);
@@ -644,12 +845,16 @@ async fn test_eth_api_receipt() -> eyre::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_eth_api_call() -> eyre::Result<()> {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let (_, nodes, _tasks, mut env, _) =
-        setup::<WorldChainDefaultContext>(3, optimism_payload_attributes, true).await?;
+    let (_, nodes, _tasks, mut env, _) = WorldChainTestBuilder::builder()
+        .nodes(3)
+        .flashblocks(true)
+        .build()
+        .setup::<WorldChainDefaultContext>()
+        .await?;
 
     let ext_context = nodes[0].ext_context.clone();
     let block_hash = nodes[0].node.block_hash(0);
@@ -723,12 +928,16 @@ async fn test_eth_api_call() -> eyre::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_op_api_supported_capabilities_call() -> eyre::Result<()> {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let (_, _nodes, _tasks, mut env, _) =
-        setup::<WorldChainDefaultContext>(1, optimism_payload_attributes, true).await?;
+    let (_, _nodes, _tasks, mut env, _) = WorldChainTestBuilder::builder()
+        .nodes(1)
+        .flashblocks(true)
+        .build()
+        .setup::<WorldChainDefaultContext>()
+        .await?;
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
@@ -743,13 +952,17 @@ async fn test_op_api_supported_capabilities_call() -> eyre::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_eth_block_by_hash_pending() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let (_, nodes, _tasks, mut env, spammer) =
-        setup::<WorldChainDefaultContext>(2, optimism_payload_attributes, true).await?;
+    let (_, nodes, _tasks, mut env, spammer) = WorldChainTestBuilder::builder()
+        .nodes(2)
+        .flashblocks(true)
+        .build()
+        .setup::<WorldChainDefaultContext>()
+        .await?;
 
     let ext_context = nodes[0].ext_context.clone();
     let block_hash = nodes[0].node.block_hash(0);
@@ -831,13 +1044,17 @@ async fn test_eth_block_by_hash_pending() -> eyre::Result<()> {
 ///
 /// Verifies that without tx_peers configuration, transactions propagate to ALL connected peers
 /// using Reth's default TransactionPropagationKind::All policy.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_default_propagation_policy() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
     // Spin up 3 nodes WITHOUT tx_peers configuration
-    let (_, mut nodes, _tasks, _, _) =
-        setup::<WorldChainDefaultContext>(3, optimism_payload_attributes, true).await?;
+    let (_, mut nodes, _tasks, _, _) = WorldChainTestBuilder::builder()
+        .nodes(3)
+        .flashblocks(true)
+        .build()
+        .setup::<WorldChainDefaultContext>()
+        .await?;
 
     let [node_0_ctx, node_1_ctx, node_2_ctx] = &mut nodes[..] else {
         unreachable!()
@@ -906,20 +1123,18 @@ async fn test_default_propagation_policy() -> eyre::Result<()> {
 /// Test Part 2:
 /// - Inject tx into Node 2 -> should propagate to both Node 0 and Node 1
 /// - Verifies multi-peer whitelist works correctly
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_selective_propagation_policy() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
     // We disconnect Node 0 from Node 2 to prevent multi-hop forwarding in Part 1
-    let (_, mut nodes, _tasks, _, _) = setup_with_tx_peers::<WorldChainDefaultContext>(
-        3,
-        optimism_payload_attributes,
-        true,
-        false,
-        true,
-        Arc::new(CHAIN_SPEC.clone()),
-    )
-    .await?;
+    let (_, mut nodes, _tasks, _, _) = WorldChainTestBuilder::builder()
+        .nodes(3)
+        .flashblocks(true)
+        .tx_peers(true)
+        .build()
+        .setup::<WorldChainDefaultContext>()
+        .await?;
 
     let [node_0_ctx, node_1_ctx, node_2_ctx] = &mut nodes[..] else {
         unreachable!()
@@ -1072,19 +1287,18 @@ async fn test_selective_propagation_policy() -> eyre::Result<()> {
 /// - Inject tx into Node 0 -> should NOT propagate to any node
 /// - Inject tx into Node 1 -> should NOT propagate to any node (even though Node 0 is whitelisted)
 /// - Verifies that disable_txpool_gossip takes precedence over tx_peers
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_gossip_disabled_no_propagation() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let (_, mut nodes, _tasks, _, _) = setup_with_tx_peers::<WorldChainDefaultContext>(
-        3,
-        optimism_payload_attributes,
-        true,
-        true,
-        true,
-        Arc::new(CHAIN_SPEC.clone()),
-    )
-    .await?;
+    let (_, mut nodes, _tasks, _, _) = WorldChainTestBuilder::builder()
+        .nodes(3)
+        .flashblocks(true)
+        .tx_peers(true)
+        .disable_gossip(true)
+        .build()
+        .setup::<WorldChainDefaultContext>()
+        .await?;
 
     let [node_0_ctx, node_1_ctx, node_2_ctx] = &mut nodes[..] else {
         unreachable!()
@@ -1146,7 +1360,7 @@ async fn test_gossip_disabled_no_propagation() -> eyre::Result<()> {
 /// 3. Flashblock indices are monotonically increasing within an epoch
 /// 4. The P2P state's flushed cursor tracks the latest yielded flashblock
 /// 5. Stale flashblocks (from old epochs) are never yielded
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_event_stream_invariants() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
@@ -1154,8 +1368,12 @@ async fn test_event_stream_invariants() -> eyre::Result<()> {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let (_, mut nodes, _tasks, mut env, tx_spammer) =
-        setup::<WorldChainDefaultContext>(1, optimism_payload_attributes, true).await?;
+    let (_, mut nodes, _tasks, mut env, tx_spammer) = WorldChainTestBuilder::builder()
+        .nodes(1)
+        .flashblocks(true)
+        .build()
+        .setup::<WorldChainDefaultContext>()
+        .await?;
 
     let builder_node = &mut nodes[0];
     let builder_context = builder_node.ext_context.clone().unwrap();
@@ -1308,7 +1526,7 @@ async fn test_event_stream_invariants() -> eyre::Result<()> {
 /// End-to-end test: uses [`EngineDriver`] to build multiple blocks while
 /// querying the pending block, logs, transactions, and receipts via the
 /// Eth JSON-RPC API at each block boundary.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_engine_driver_pending_block_queries() -> eyre::Result<()> {
     use alloy_eips::BlockNumberOrTag;
     use reth_rpc_api::EthApiClient;
@@ -1321,8 +1539,12 @@ async fn test_engine_driver_pending_block_queries() -> eyre::Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // 2 nodes: builder + follower
-    let (_, nodes, _tasks, mut env, tx_spammer) =
-        setup::<WorldChainDefaultContext>(2, optimism_payload_attributes, true).await?;
+    let (_, nodes, _tasks, mut env, tx_spammer) = WorldChainTestBuilder::builder()
+        .nodes(2)
+        .flashblocks(true)
+        .build()
+        .setup::<WorldChainDefaultContext>()
+        .await?;
 
     let builder_context = nodes[0].ext_context.clone().unwrap();
     let block_hash = nodes[0].node.block_hash(0);
@@ -1505,7 +1727,7 @@ async fn test_engine_driver_pending_block_queries() -> eyre::Result<()> {
 /// Large block production loop using [`EngineDriver`] that sanity-checks
 /// all helper macros in the `on_block` hook: `provider!`, `fetch_block!`,
 /// `fetch_tx!`, `fetch_receipt!`, `eth_call!`, `fetch_logs!`.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_eth_api_assertions() -> eyre::Result<()> {
     use alloy_provider::Provider;
     use alloy_rpc_types::Filter;
@@ -1517,8 +1739,12 @@ async fn test_eth_api_assertions() -> eyre::Result<()> {
     const NUM_BLOCKS: usize = 5;
     const BLOCK_INTERVAL: Duration = Duration::from_millis(2000);
 
-    let (_, nodes, _tasks, mut env, tx_spammer) =
-        setup::<WorldChainDefaultContext>(1, optimism_payload_attributes, true).await?;
+    let (_, nodes, _tasks, mut env, tx_spammer) = WorldChainTestBuilder::builder()
+        .nodes(1)
+        .flashblocks(true)
+        .build()
+        .setup::<WorldChainDefaultContext>()
+        .await?;
 
     let builder_context = nodes[0].ext_context.clone().unwrap();
     let block_hash = nodes[0].node.block_hash(0);
@@ -1740,7 +1966,7 @@ async fn test_eth_api_assertions() -> eyre::Result<()> {
 /// - For each block, expect: Canon(N), then Pending(0, is_base=true), then
 ///   at least one more Pending with increasing indices
 /// - After all blocks, verify all assertions passed
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_assertion_driven_event_stream() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1748,8 +1974,12 @@ async fn test_assertion_driven_event_stream() -> eyre::Result<()> {
     const NUM_BLOCKS: usize = 3;
     const BLOCK_INTERVAL: Duration = Duration::from_millis(2000);
 
-    let (_, nodes, _tasks, mut env, tx_spammer) =
-        setup::<WorldChainDefaultContext>(1, optimism_payload_attributes, true).await?;
+    let (_, nodes, _tasks, mut env, tx_spammer) = WorldChainTestBuilder::builder()
+        .nodes(1)
+        .flashblocks(true)
+        .build()
+        .setup::<WorldChainDefaultContext>()
+        .await?;
 
     let builder_context = nodes[0].ext_context.clone().unwrap();
     let block_hash = nodes[0].node.block_hash(0);
@@ -1867,8 +2097,12 @@ async fn test_assertion_driven_event_stream() -> eyre::Result<()> {
 async fn test_double_failover() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let (_, nodes, _tasks, _, _) =
-        setup::<WorldChainDefaultContext>(3, optimism_payload_attributes, true).await?;
+    let (_, nodes, _tasks, _, _) = WorldChainTestBuilder::builder()
+        .nodes(3)
+        .flashblocks(true)
+        .build()
+        .setup::<WorldChainDefaultContext>()
+        .await?;
 
     let authorizer = SigningKey::from_bytes(&[0; 32]);
 
@@ -1949,8 +2183,12 @@ async fn test_double_failover() -> eyre::Result<()> {
 async fn test_force_race_condition() -> eyre::Result<()> {
     let _tracing = init_tracing("warn,flashblocks=trace");
 
-    let (_, nodes, _tasks, _, _) =
-        setup::<WorldChainDefaultContext>(3, optimism_payload_attributes, true).await?;
+    let (_, nodes, _tasks, _, _) = WorldChainTestBuilder::builder()
+        .nodes(3)
+        .flashblocks(true)
+        .build()
+        .setup::<WorldChainDefaultContext>()
+        .await?;
 
     let authorizer = SigningKey::from_bytes(&[0; 32]);
 
@@ -2046,8 +2284,12 @@ async fn test_force_race_condition() -> eyre::Result<()> {
 async fn test_receive_peer_latency_scores_are_recorded() -> eyre::Result<()> {
     let _tracing = init_tracing("warn,flashblocks=trace");
 
-    let (_, nodes, _tasks, _, _) =
-        setup::<WorldChainDefaultContext>(3, optimism_payload_attributes, true).await?;
+    let (_, nodes, _tasks, _, _) = WorldChainTestBuilder::builder()
+        .nodes(3)
+        .flashblocks(true)
+        .build()
+        .setup::<WorldChainDefaultContext>()
+        .await?;
 
     let authorizer = SigningKey::from_bytes(&[0; 32]);
     let p2p_0 = nodes[0].ext_context.clone().unwrap().flashblocks_handle;
@@ -2134,8 +2376,12 @@ async fn test_receive_peer_latency_scores_are_recorded() -> eyre::Result<()> {
 async fn test_get_block_by_number_pending() -> eyre::Result<()> {
     let _tracing = init_tracing("warn,flashblocks=trace");
 
-    let (_, nodes, _tasks, _, _) =
-        setup::<WorldChainDefaultContext>(1, optimism_payload_attributes, true).await?;
+    let (_, nodes, _tasks, _, _) = WorldChainTestBuilder::builder()
+        .nodes(1)
+        .flashblocks(true)
+        .build()
+        .setup::<WorldChainDefaultContext>()
+        .await?;
 
     let authorizer = SigningKey::from_bytes(&[0; 32]);
     let p2p_0 = nodes[0].ext_context.clone().unwrap().flashblocks_handle;
@@ -2188,8 +2434,12 @@ async fn test_get_block_by_number_pending() -> eyre::Result<()> {
 async fn test_peer_reputation() -> eyre::Result<()> {
     let _tracing = init_tracing("warn,flashblocks=trace");
 
-    let (_, nodes, _tasks, _, _) =
-        setup::<WorldChainDefaultContext>(2, optimism_payload_attributes, true).await?;
+    let (_, nodes, _tasks, _, _) = WorldChainTestBuilder::builder()
+        .nodes(2)
+        .flashblocks(true)
+        .build()
+        .setup::<WorldChainDefaultContext>()
+        .await?;
 
     let p2p_0 = nodes[0].ext_context.clone().unwrap().flashblocks_handle;
     let network_1 = &nodes[1].node.inner.network;
@@ -2289,7 +2539,7 @@ async fn test_peer_monitoring() -> eyre::Result<()> {
         reth_node_core::exit::NodeExitFuture,
         Box<dyn std::any::Any + Sync + Send>,
     )> {
-        let op_chain_spec: Arc<reth_optimism_chainspec::OpChainSpec> = Arc::new(CHAIN_SPEC.clone());
+        let chain_spec: Arc<world_chain_chainspec::WorldChainSpec> = Arc::new(CHAIN_SPEC.clone());
 
         let mut network_config = NetworkArgs {
             discovery: DiscoveryArgs {
@@ -2317,8 +2567,8 @@ async fn test_peer_monitoring() -> eyre::Result<()> {
             })
             .collect();
 
-        let mut node_config = NodeConfig::new(op_chain_spec.clone())
-            .with_chain(op_chain_spec)
+        let mut node_config = NodeConfig::new(chain_spec.clone())
+            .with_chain(chain_spec)
             .with_network(network_config)
             .with_rpc(RpcServerArgs::default().with_unused_ports().with_http());
 
@@ -2344,6 +2594,7 @@ async fn test_peer_monitoring() -> eyre::Result<()> {
             builder,
             pbh,
             flashblocks: Some(test_flashblocks_args(&authorizer_sk, &builder_sk)),
+            witness: Default::default(),
             tx_peers: None,
             disable_bootnodes: true,
             simulate_enabled: false,
@@ -2650,6 +2901,10 @@ fn test_flashblocks_args(authorizer_sk: &SigningKey, builder_sk: &SigningKey) ->
         flashblocks_interval: 200,
         recommit_interval: 200,
         access_list: true,
+        store: false,
+        store_path: None,
+        sentry_peers: Vec::new(),
+        max_sentry_connections: world_chain_cli::cli::builder::DEFAULT_MAX_SENTRY_CONNECTIONS,
         fanout: Default::default(),
     }
 }
@@ -2900,15 +3155,19 @@ async fn p2p_wait_for_pending_block(
 /// 2. Follower processes flashblocks through the coordinator (`validate_flashblock_with_state`)
 /// 3. After mining, the builder's `get_payload_v4` result and the follower's coordinator
 ///    pending block should agree on block_hash, state_root, receipts_root, and gas_used.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_coordinator_payload_matches_builder() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
     const TRANSACTIONS_PER_FLASHBLOCK: u64 = 10;
 
     // Builder (node 0) and Follower (node 1) with flashblocks enabled
-    let (_, mut nodes, _tasks, mut env, tx_spammer) =
-        setup::<WorldChainDefaultContext>(2, optimism_payload_attributes, true).await?;
+    let (_, mut nodes, _tasks, mut env, tx_spammer) = WorldChainTestBuilder::builder()
+        .nodes(2)
+        .flashblocks(true)
+        .build()
+        .setup::<WorldChainDefaultContext>()
+        .await?;
 
     let [builder_node, follower_node] = &mut nodes[..] else {
         unreachable!()

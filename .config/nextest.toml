@@ -1,6 +1,35 @@
 [profile.default]
 failure-output = "immediate-final"
 success-output = "never"
+slow-timeout = { period = "120s", terminate-after = 3 }
+
+# Each Docker-backed devnet test stands up a whole OP Stack; two at once oversubscribe the Docker
+# daemon badly enough that both miss their deadlines. Other tests still use the remaining threads.
+[test-groups.devnet-stack]
+max-threads = 1
+
+# Fork-backed RPC tests share one rate-limited archive endpoint in CI. Running them concurrently
+# causes provider-level `-32005 rate limit exceeded` failures before assertions are reached.
+[test-groups.worldchain-rpc-fork]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'package(world-chain-tests)'
+threads-required = 4
+
+[[profile.default.overrides]]
+filter = 'package(world-chain-rpc) & binary(fork_simulate)'
+test-group = "worldchain-rpc-fork"
+
+# The excluded test builds `without_l1()` in-process and needs no Docker.
+[[profile.default.overrides]]
+filter = 'test(/^it::devnet_/) - test(=it::devnet_smoke::devnet_run_until_shutdown_uses_continuous_block_driver)'
+test-group = "devnet-stack"
+slow-timeout = { period = "300s", terminate-after = 8 }
+
+[[profile.default.overrides]]
+filter = 'test(/acceptance_tests::/)'
+slow-timeout = { period = "300s", terminate-after = 6 }
 
 [profile.default.junit]
 path = "target/nextest/junit.xml"
@@ -10,3 +39,7 @@ store-success-output = false
 [profile.ci]
 fail-fast = false
 failure-output = "immediate-final"
+
+[[profile.ci.overrides]]
+filter = 'package(world-chain-tests) - test(/acceptance_tests::/)'
+retries = { backoff = "exponential", count = 2, delay = "2s", jitter = true }

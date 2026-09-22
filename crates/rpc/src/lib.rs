@@ -1,6 +1,9 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![allow(clippy::type_complexity)]
 
+pub mod admin;
+pub use admin::{AdminApiExtServer, WorldChainAdminApiExt};
+
 pub mod engine;
 pub mod eth;
 pub mod op;
@@ -19,6 +22,11 @@ pub use core::{EthApiExtServer, WorldChainEthApiExt};
 
 pub mod simulate;
 pub use simulate::{Simulate, SimulateApiServer};
+
+pub mod simulate_consts;
+
+pub mod witness;
+pub use witness::{DebugWitnessOracle, DebugWitnessOracleApiServer};
 
 pub mod debank;
 pub mod trace;

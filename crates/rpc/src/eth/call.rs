@@ -52,4 +52,9 @@ where
     fn evm_memory_limit(&self) -> u64 {
         self.inner.evm_memory_limit()
     }
+
+    #[inline]
+    fn compute_state_root_for_eth_simulate(&self) -> bool {
+        self.inner.compute_state_root_for_eth_simulate()
+    }
 }

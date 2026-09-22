@@ -1,12 +1,11 @@
 use crate::{
     payload_builder_metrics::{PayloadBuildRejectionReason, PayloadBuildTaskOutcome},
-    state_db::StateDB,
     traits::{context::PayloadBuilderCtx, context_builder::PayloadBuilderCtxBuilder},
-    utils::estimated_da_size_bytes,
 };
 use alloy_consensus::{Block, SignableTransaction, Transaction, transaction::SignerRecoverable};
 use alloy_eips::{Encodable2718, Typed2718};
 use alloy_network::{TransactionBuilder, TxSignerSync};
+use alloy_op_evm::block::PreRefundGasUsed;
 use alloy_primitives::{Address, U256};
 use alloy_signer_local::PrivateKeySigner;
 use eyre::eyre::eyre;
@@ -22,10 +21,9 @@ use reth_evm::{
     execute::{BlockBuilder, BlockExecutor},
 };
 use reth_node_api::PayloadBuilderError;
-use reth_optimism_chainspec::OpChainSpec;
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_node::{
-    OpBuiltPayload, OpEvmConfig, OpNextBlockEnvAttributes, OpPayloadBuilderAttributes,
+    OpBuiltPayload, OpNextBlockEnvAttributes, OpPayloadBuilderAttributes,
     txpool::estimated_da_size::DataAvailabilitySized,
 };
 use reth_optimism_payload_builder::{
@@ -39,11 +37,13 @@ use reth_primitives_traits::{HeaderTy, Recovered, SealedHeader, TxTy};
 use reth_provider::{BlockReaderIdExt, ChainSpecProvider, StateProviderFactory};
 use reth_revm::cancelled::CancelOnDrop;
 use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction, TransactionPool};
-use revm::{Database as RevmDatabase, DatabaseCommit, context::BlockEnv};
+use revm::{Database as RevmDatabase, context::BlockEnv};
 use revm_database::State;
 use semaphore_rs::Field;
 use std::{collections::HashSet, fmt::Debug, sync::Arc, time::Instant};
 use tracing::{error, trace};
+use world_chain_chainspec::WorldChainSpec;
+use world_chain_evm::{WorldChainEvmConfig, utils::estimated_da_size_bytes};
 use world_chain_pool::{
     bindings::IPBHEntryPoint::spendNullifierHashesCall,
     tx::{WorldChainPoolTransaction, WorldChainPooledTransaction},
@@ -52,7 +52,8 @@ use world_chain_pool::{
 /// Container type that holds all necessities to build a new payload.
 #[derive(Debug, Clone)]
 pub struct WorldChainPayloadBuilderCtx<Client: ChainSpecProvider> {
-    pub inner: Arc<OpPayloadBuilderCtx<OpEvmConfig, <Client as ChainSpecProvider>::ChainSpec>>,
+    pub inner:
+        Arc<OpPayloadBuilderCtx<WorldChainEvmConfig, <Client as ChainSpecProvider>::ChainSpec>>,
     pub verified_blockspace_capacity: u8,
     pub pbh_entry_point: Address,
     pub pbh_signature_aggregator: Address,
@@ -83,12 +84,15 @@ where
         info: &mut ExecutionInfo,
         base_fee: u64,
         gas_used: u64,
+        evm_gas_used: u64,
         tx_da_size: u64,
         tx: Recovered<OpTransactionSigned>,
     ) {
         // add gas used by the transaction to cumulative gas used, before creating the
         // receipt
         info.cumulative_gas_used += gas_used;
+
+        info.cumulative_evm_gas_used += evm_gas_used;
         info.cumulative_da_bytes_used += tx_da_size;
 
         // update add to total fees
@@ -106,7 +110,7 @@ where
         + ChainSpecProvider<ChainSpec: OpHardforks>
         + Clone,
 {
-    type Evm = OpEvmConfig;
+    type Evm = WorldChainEvmConfig;
     type ChainSpec = <Client as ChainSpecProvider>::ChainSpec;
     type Transaction = WorldChainPooledTransaction;
 
@@ -201,10 +205,10 @@ where
         &self,
         builder: &mut impl BlockBuilder<
             Primitives = <Self::Evm as ConfigureEvm>::Primitives,
-            Executor: BlockExecutor<Evm: Evm<DB: StateDB + DatabaseCommit + reth_evm::Database>>,
+            Executor: BlockExecutor<Evm: Evm<DB: reth_evm::block::StateDB + reth_evm::Database>>,
         >,
     ) -> Result<ExecutionInfo, PayloadBuilderError> {
-        self.inner.execute_sequencer_transactions(builder)
+        self.inner.execute_sequencer_transactions(builder, None)
     }
 
     /// Executes the given best transactions and updates the execution info.
@@ -226,9 +230,10 @@ where
                 Primitives = <Self::Evm as ConfigureEvm>::Primitives,
                 Executor: BlockExecutor<
                     Evm: Evm<
-                        DB: StateDB + DatabaseCommit + reth_evm::Database,
+                        DB: reth_evm::block::StateDB + reth_evm::Database,
                         BlockEnv = BlockEnv,
                     >,
+                    Result: PreRefundGasUsed,
                 >,
             >,
         Txs: PayloadTransactions<
@@ -266,10 +271,16 @@ where
             let tx_uncompressed_size = tx.encode_2718_len() as u64;
             attempt_metrics.record_transaction_size_bytes(tx_uncompressed_size);
             attempt_metrics.record_transaction_da_size_bytes(tx_da_size);
-            cumulative_uncompressed_bytes += tx_uncompressed_size;
+            // Note: `cumulative_uncompressed_bytes` is only advanced once a transaction is actually
+            // committed to the block (see after `commit_changes` below). It must not be mutated for
+            // transactions that are merely considered, otherwise rejected / skipped transactions
+            // (e.g. a just-mined tx that the pool has not yet dropped and that fails with
+            // nonce-too-low) would permanently inflate the running total and cause otherwise-fitting
+            // transactions to be spuriously rejected against the limit.
             let is_uncompressed_block_full =
                 if let Some(block_uncompressed_size_limit) = self.block_uncompressed_size_limit {
-                    let result = cumulative_uncompressed_bytes > block_uncompressed_size_limit;
+                    let result = cumulative_uncompressed_bytes + tx_uncompressed_size
+                        > block_uncompressed_size_limit;
                     if result {
                         tracing::warn!(
                             "we've reached block uncompressed size limit - rejecting tx: {:?}",
@@ -294,6 +305,8 @@ where
                 block_da_limit,
                 tx.gas_limit(),
                 da_footprint_gas_scalar,
+                tx_uncompressed_size,
+                self.block_uncompressed_size_limit,
             ) {
                 attempt_metrics.increment_rejection(PayloadBuildRejectionReason::OverLimits);
                 // we can't fit this transaction into the block, so we need to mark it as
@@ -337,7 +350,12 @@ where
             }
 
             let tx_execution_started = Instant::now();
-            let execution_result = builder.execute_transaction(tx.clone());
+
+            let mut evm_gas_used = 0u64;
+            let execution_result =
+                builder.execute_transaction_with_result_closure(tx.clone(), |result| {
+                    evm_gas_used = result.evm_gas_used();
+                });
             attempt_metrics.record_transaction_execution_duration(tx_execution_started.elapsed());
             let gas_used = match execution_result {
                 Ok(res) => {
@@ -382,9 +400,13 @@ where
                 }
             };
 
+            let gas_used = gas_used.tx_gas_used();
             attempt_metrics.record_transaction_gas_used(gas_used);
             transactions_executed += 1;
-            self.commit_changes(info, base_fee, gas_used, tx_da_size, tx);
+            self.commit_changes(info, base_fee, gas_used, evm_gas_used, tx_da_size, tx);
+            // Only count bytes for transactions that made it into the block, mirroring how gas and
+            // DA usage are accumulated in `commit_changes`.
+            cumulative_uncompressed_bytes += tx_uncompressed_size;
         }
 
         if !spent_nullifier_hashes.is_empty() {
@@ -406,10 +428,14 @@ where
             // insufficient funds, continue with the built payload. This ensures that
             // PBH transactions still receive priority inclusion, even if the PBH nullifier
             // is not spent rather than sitting in the default execution client's mempool.
-            match builder.execute_transaction(tx.clone()) {
+            let mut evm_gas_used = 0u64;
+            match builder.execute_transaction_with_result_closure(tx.clone(), |result| {
+                evm_gas_used = result.evm_gas_used();
+            }) {
                 Ok(gas_used) => {
+                    let gas_used = gas_used.tx_gas_used();
                     let tx_da_size = estimated_da_size_bytes(&tx);
-                    self.commit_changes(info, base_fee, gas_used, tx_da_size, tx);
+                    self.commit_changes(info, base_fee, gas_used, evm_gas_used, tx_da_size, tx);
                     attempt_metrics
                         .record_spend_nullifiers_outcome(PayloadBuildTaskOutcome::Success);
                 }
@@ -435,11 +461,11 @@ where
     }
 }
 
-impl<Provider> PayloadBuilderCtxBuilder<Provider, OpEvmConfig, OpChainSpec>
+impl<Provider> PayloadBuilderCtxBuilder<Provider, WorldChainEvmConfig, WorldChainSpec>
     for WorldChainPayloadBuilderCtxBuilder
 where
     Provider: StateProviderFactory
-        + ChainSpecProvider<ChainSpec = OpChainSpec>
+        + ChainSpecProvider<ChainSpec = WorldChainSpec>
         + Send
         + Sync
         + BlockReaderIdExt<Block = Block<OpTransactionSigned>>
@@ -450,14 +476,14 @@ where
     fn build(
         &self,
         provider: Provider,
-        evm_config: OpEvmConfig,
+        evm_config: WorldChainEvmConfig,
         builder_config: OpBuilderConfig,
         config: PayloadConfig<
-            OpPayloadBuilderAttributes<TxTy<<OpEvmConfig as ConfigureEvm>::Primitives>>,
-            HeaderTy<<OpEvmConfig as ConfigureEvm>::Primitives>,
+            OpPayloadBuilderAttributes<TxTy<<WorldChainEvmConfig as ConfigureEvm>::Primitives>>,
+            HeaderTy<<WorldChainEvmConfig as ConfigureEvm>::Primitives>,
         >,
         cancel: &CancelOnDrop,
-        best_payload: Option<OpBuiltPayload<<OpEvmConfig as ConfigureEvm>::Primitives>>,
+        best_payload: Option<OpBuiltPayload<<WorldChainEvmConfig as ConfigureEvm>::Primitives>>,
     ) -> Self::PayloadBuilderCtx
     where
         Self: Sized,

@@ -1,0 +1,202 @@
+# syntax=docker/dockerfile:1.10
+ARG SP1_GUEST_PLATFORM=linux/amd64
+
+# Image for the host-side prover binaries (proofs/*). PROVER_PACKAGE and PROVER_BIN are
+# required build args (no defaults). FEATURES defaults to empty (package default features
+# apply); pass an explicit comma-separated list to enable additional cargo features.
+# Examples:
+#   PROVER_PACKAGE=world-chain-prover-sp1        PROVER_BIN=world-chain-prover-sp1        FEATURES=
+#   PROVER_PACKAGE=world-chain-proof-sp1-worker  PROVER_BIN=world-chain-proof-sp1-worker  FEATURES=
+# Mirrors the caching strategy of the main Dockerfile (cargo-chef + sccache/S3).
+FROM public.ecr.aws/docker/library/rust:1.95.0-bookworm AS base
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+  --mount=type=cache,target=/usr/local/cargo/git \
+  cargo install --locked sccache --version ^0.9 \
+  && cargo install --locked cargo-chef --version ^0.1
+
+# clang/llvm for C deps; protobuf-compiler + libprotobuf-dev for the sp1-sdk `network`
+# (gRPC) client — libprotobuf-dev provides the well-known type .proto files
+# (google/protobuf/*.proto) under /usr/include that protoc resolves imports against.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends clang libclang-dev gcc protobuf-compiler libprotobuf-dev git \
+  && rm -rf /var/lib/apt/lists/*
+
+ENV CARGO_HOME=/usr/local/cargo \
+    RUSTC_WRAPPER=sccache \
+    SCCACHE_DIR=/sccache
+
+# Canonical SP1 guest builder. This is the same linux/amd64 image and `/root/program`
+# workspace layout used by sp1-build's reproducible Docker mode. The digest is the
+# governance boundary: changing it intentionally rotates the ELF hashes and vkeys.
+FROM --platform=${SP1_GUEST_PLATFORM} ghcr.io/succinctlabs/sp1:v6.3.1@sha256:7c1c8201de6f63e3f1fb9075bd9a67a4c5fc8c2d546d11a5ff71587bb51e6eb3 AS sp1-guests
+WORKDIR /root/program
+
+COPY . .
+
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    CFLAGS_riscv32im_succinct_zkvm_elf=-D__ILP32__ \
+    RUSTUP_TOOLCHAIN=succinct \
+    cargo run --locked --release --ignore-rust-version \
+      -p world-chain-proof-sp1-guest-builder
+
+# Export only the final canonical guest ELFs. CI builds this target once on
+# amd64 and supplies it as a named `sp1-guests-context` build context to every
+# SP1 worker build, so arm64 never has to emulate the SP1 compiler.
+FROM scratch AS sp1-guests-context
+COPY --from=sp1-guests \
+    /root/program/proofs/measured/sp1-programs/target/elf-compilation/docker/riscv64im-succinct-zkvm-elf/release/world-chain-proof-succinct-range-ethereum \
+    /riscv64im-succinct-zkvm-elf/release/world-chain-proof-succinct-range-ethereum
+COPY --from=sp1-guests \
+    /root/program/proofs/measured/sp1-programs/target/elf-compilation/docker/riscv64im-succinct-zkvm-elf/release/world-chain-proof-succinct-aggregation \
+    /riscv64im-succinct-zkvm-elf/release/world-chain-proof-succinct-aggregation
+
+FROM base AS planner
+WORKDIR /app
+
+COPY . .
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+  --mount=type=cache,target=/usr/local/cargo/git \
+  --mount=type=cache,target=$SCCACHE_DIR,sharing=locked \
+  cargo chef prepare --recipe-path recipe.json
+
+FROM base AS builder-common
+WORKDIR /app
+
+ARG PROVER_PACKAGE
+ARG PROVER_BIN
+ARG PROFILE="maxperf"
+# Default empty: package default features apply. Pass an explicit comma-separated
+# list (e.g. FEATURES=embedded-elfs) to enable additional features.
+ARG FEATURES=""
+ARG SCCACHE_BUCKET
+ARG SCCACHE_REGION
+ARG SCCACHE_S3_KEY_PREFIX
+
+RUN test -n "${PROVER_PACKAGE}" || (echo "ERROR: PROVER_PACKAGE build arg is required" && exit 1)
+RUN test -n "${PROVER_BIN}" || (echo "ERROR: PROVER_BIN build arg is required" && exit 1)
+
+COPY --from=planner /app/recipe.json recipe.json
+
+# The measured crates are standalone workspaces (excluded from the root workspace), which
+# cargo-chef's recipe cannot reconstruct — cook needs their real sources to resolve the
+# root workspace's path dependencies on them.
+COPY proofs/measured proofs/measured
+
+FROM builder-common AS builder-deps
+
+# SP1 deployables must use the dedicated `sp1-worker` target below. Local SP1
+# compilation is path-dependent and cannot define production governance keys.
+RUN test "${PROVER_PACKAGE}" != "world-chain-proof-sp1-worker" || \
+    (echo "ERROR: build the SP1 worker with --target sp1-worker" && exit 1)
+
+ENV SP1_BUILD_DOCKER=false
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=$SCCACHE_DIR,sharing=locked \
+    --mount=type=secret,id=aws_access_key_id,env=AWS_ACCESS_KEY_ID \
+    --mount=type=secret,id=aws_secret_access_key,env=AWS_SECRET_ACCESS_KEY \
+    --mount=type=secret,id=aws_session_token,env=AWS_SESSION_TOKEN \
+    if [ -z "$SCCACHE_BUCKET" ]; then unset SCCACHE_BUCKET SCCACHE_REGION SCCACHE_S3_KEY_PREFIX; fi && \
+    cargo chef cook --locked --profile ${PROFILE} -p ${PROVER_PACKAGE} --bin ${PROVER_BIN} ${FEATURES:+--features ${FEATURES}} --recipe-path recipe.json
+
+FROM builder-deps AS builder
+
+ARG VERGEN_GIT_SHA
+COPY . .
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=$SCCACHE_DIR,sharing=locked \
+    --mount=type=secret,id=aws_access_key_id,env=AWS_ACCESS_KEY_ID \
+    --mount=type=secret,id=aws_secret_access_key,env=AWS_SECRET_ACCESS_KEY \
+    --mount=type=secret,id=aws_session_token,env=AWS_SESSION_TOKEN \
+    if [ -z "$SCCACHE_BUCKET" ]; then unset SCCACHE_BUCKET SCCACHE_REGION SCCACHE_S3_KEY_PREFIX; fi && \
+    cargo build --locked --profile ${PROFILE} -p ${PROVER_PACKAGE} ${FEATURES:+--features ${FEATURES}} --bin ${PROVER_BIN}
+
+FROM builder-common AS sp1-builder-deps
+
+RUN test "${PROVER_PACKAGE}" = "world-chain-proof-sp1-worker" || \
+    (echo "ERROR: the sp1-worker target only builds world-chain-proof-sp1-worker" && exit 1)
+RUN test "${PROVER_BIN}" = "world-chain-proof-sp1-worker" || \
+    (echo "ERROR: the sp1-worker target only builds world-chain-proof-sp1-worker" && exit 1)
+
+# sp1-build still emits the include_elf! paths in skip mode. Selecting Docker
+# mode points those paths at the canonical artifacts copied from `sp1-guests`.
+ENV SP1_BUILD_DOCKER=true \
+    SP1_SKIP_PROGRAM_BUILD=true
+
+COPY --from=sp1-guests-context \
+    /riscv64im-succinct-zkvm-elf/release/world-chain-proof-succinct-range-ethereum \
+    /app/proofs/measured/sp1-programs/target/elf-compilation/docker/riscv64im-succinct-zkvm-elf/release/world-chain-proof-succinct-range-ethereum
+COPY --from=sp1-guests-context \
+    /riscv64im-succinct-zkvm-elf/release/world-chain-proof-succinct-aggregation \
+    /app/proofs/measured/sp1-programs/target/elf-compilation/docker/riscv64im-succinct-zkvm-elf/release/world-chain-proof-succinct-aggregation
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=$SCCACHE_DIR,sharing=locked \
+    --mount=type=secret,id=aws_access_key_id,env=AWS_ACCESS_KEY_ID \
+    --mount=type=secret,id=aws_secret_access_key,env=AWS_SECRET_ACCESS_KEY \
+    --mount=type=secret,id=aws_session_token,env=AWS_SESSION_TOKEN \
+    if [ -z "$SCCACHE_BUCKET" ]; then unset SCCACHE_BUCKET SCCACHE_REGION SCCACHE_S3_KEY_PREFIX; fi && \
+    cargo chef cook --locked --profile ${PROFILE} -p ${PROVER_PACKAGE} --bin ${PROVER_BIN} ${FEATURES:+--features ${FEATURES}} --recipe-path recipe.json
+
+FROM sp1-builder-deps AS sp1-builder
+
+ARG VERGEN_GIT_SHA
+COPY . .
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=$SCCACHE_DIR,sharing=locked \
+    --mount=type=secret,id=aws_access_key_id,env=AWS_ACCESS_KEY_ID \
+    --mount=type=secret,id=aws_secret_access_key,env=AWS_SECRET_ACCESS_KEY \
+    --mount=type=secret,id=aws_session_token,env=AWS_SESSION_TOKEN \
+    if [ -z "$SCCACHE_BUCKET" ]; then unset SCCACHE_BUCKET SCCACHE_REGION SCCACHE_S3_KEY_PREFIX; fi && \
+    cargo build --locked --profile ${PROFILE} -p ${PROVER_PACKAGE} ${FEATURES:+--features ${FEATURES}} --bin ${PROVER_BIN}
+
+# Cargo's built-in `dev` and `release` profiles use directory names that differ
+# from the profile flag. Stage the binary at a profile-independent path.
+RUN profile_dir="${PROFILE}" && \
+    if [ "${PROFILE}" = "dev" ]; then profile_dir="debug"; fi && \
+    if [ "${PROFILE}" = "release" ]; then profile_dir="release"; fi && \
+    install -D "/app/target/${profile_dir}/${PROVER_BIN}" "/app/bin/${PROVER_BIN}"
+
+# Validate the bytes actually linked into the worker, not only the intermediate files.
+RUN /app/bin/${PROVER_BIN} vkeys \
+    --check /app/proofs/measurements.json
+
+FROM public.ecr.aws/docker/library/debian:bookworm-slim AS runtime
+WORKDIR /app
+
+RUN apt-get update && \
+  apt-get install -y --no-install-recommends \
+  ca-certificates \
+  tzdata && \
+  apt-get clean && \
+  rm -rf /var/lib/apt/lists/*
+
+FROM runtime AS sp1-worker
+
+ARG PROVER_BIN
+RUN test "${PROVER_BIN}" = "world-chain-proof-sp1-worker" || \
+    (echo "ERROR: the sp1-worker target only packages world-chain-proof-sp1-worker" && exit 1)
+ARG PROFILE="maxperf"
+COPY --from=sp1-builder /app/bin/${PROVER_BIN} /usr/local/bin/${PROVER_BIN}
+RUN ln -s /usr/local/bin/${PROVER_BIN} /usr/local/bin/entrypoint
+
+ENTRYPOINT ["/usr/local/bin/entrypoint"]
+
+FROM runtime AS final
+
+ARG PROVER_BIN
+RUN test -n "${PROVER_BIN}" || (echo "ERROR: PROVER_BIN build arg is required" && exit 1)
+ARG PROFILE="maxperf"
+COPY --from=builder /app/target/${PROFILE}/${PROVER_BIN} /usr/local/bin/${PROVER_BIN}
+RUN ln -s /usr/local/bin/${PROVER_BIN} /usr/local/bin/entrypoint
+
+ENTRYPOINT ["/usr/local/bin/entrypoint"]

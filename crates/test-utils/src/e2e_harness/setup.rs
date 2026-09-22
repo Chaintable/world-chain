@@ -15,6 +15,7 @@ use alloy_rpc_types_engine::{
     CancunPayloadFields, ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3,
     PraguePayloadFields,
 };
+use bon::Builder;
 use ed25519_dalek::SigningKey;
 use eyre::eyre::eyre;
 use op_alloy_consensus::{OpTxEnvelope, TxDeposit, encode_holocene_extra_data};
@@ -38,11 +39,11 @@ use reth_node_builder::{
     rpc::{EngineValidatorAddOn, RethRpcAddOns},
 };
 use reth_node_core::args::{PayloadBuilderArgs, RpcServerArgs};
-use reth_optimism_chainspec::{OpChainSpec, OpChainSpecBuilder};
 use reth_optimism_forks::OpHardfork;
 use reth_optimism_node::OpPayloadAttributes;
 use reth_optimism_payload_builder::OpPayloadAttrs;
 use reth_provider::providers::{BlockchainProvider, ChainStorage};
+use reth_rpc_server_types::RpcModuleSelection;
 use reth_tasks::{Runtime, TaskExecutor};
 use revm_primitives::{B256, Bytes, TxKind, U256};
 use std::{
@@ -52,6 +53,7 @@ use std::{
     time::Duration,
 };
 use tracing::{info, span};
+use world_chain_chainspec::{WorldChainSpec, WorldChainSpecBuilder};
 use world_chain_node::{
     FlashblocksOpApi, OpApiExtServer,
     node::{WorldChainNode, WorldChainNodeContext, WorldChainNodePrimitiveTypes},
@@ -165,6 +167,87 @@ type WorldChainNodeTestContext<T> = NodeHelperType<
     BlockchainProvider<NodeTypesWithDBAdapter<WorldChainNode<T>, TmpDB>>,
 >;
 
+/// Builder for in-process World Chain test swarms.
+///
+/// The defaults match the historical `setup` helper: one node, default chain
+/// spec, transaction gossip enabled, flashblocks disabled, and no block-size
+/// override.
+#[derive(Clone, Debug, Builder)]
+pub struct WorldChainTestBuilder {
+    #[builder(default = 1)]
+    nodes: u8,
+    #[builder(default)]
+    flashblocks: bool,
+    #[builder(default = true)]
+    access_list: bool,
+    #[builder(default)]
+    tx_peers: bool,
+    #[builder(default)]
+    disable_gossip: bool,
+    /// Enables the `admin` RPC namespace on the HTTP server (off by default).
+    #[builder(default)]
+    admin_rpc: bool,
+    block_uncompressed_size_limit: Option<u64>,
+    #[builder(default = Arc::new(CHAIN_SPEC.clone()))]
+    chain_spec: Arc<WorldChainSpec>,
+}
+
+impl WorldChainTestBuilder {
+    pub async fn setup<T>(
+        self,
+    ) -> eyre::Result<(
+        Range<u8>,
+        Vec<WorldChainTestingNodeContext<T>>,
+        TaskExecutor,
+        Environment<<WorldChainNode<T> as NodeTypes>::Payload>,
+        TxSpammer<<WorldChainNode<T> as NodeTypes>::Payload>,
+    )>
+    where
+        T: WorldChainTestContextBounds<ChainSpec = WorldChainSpec>,
+        <WorldChainNode<T> as NodeTypes>::Payload: PayloadTypes<PayloadAttributes = OpPayloadAttrs>,
+        WorldChainNode<T>: WorldChainNodeTestBounds<T>,
+    {
+        self.setup_with::<T, _>(world_chain_payload_attributes)
+            .await
+    }
+
+    pub async fn setup_with<T, G>(
+        self,
+        attributes_generator: G,
+    ) -> eyre::Result<(
+        Range<u8>,
+        Vec<WorldChainTestingNodeContext<T>>,
+        TaskExecutor,
+        Environment<<WorldChainNode<T> as NodeTypes>::Payload>,
+        TxSpammer<<WorldChainNode<T> as NodeTypes>::Payload>,
+    )>
+    where
+        T: WorldChainTestContextBounds<ChainSpec = WorldChainSpec>,
+        WorldChainNode<T>: WorldChainNodeTestBounds<T>,
+        G: Fn(
+                u64,
+            )
+                -> <<WorldChainNode<T> as NodeTypes>::Payload as PayloadTypes>::PayloadAttributes
+            + Send
+            + Sync
+            + Copy
+            + 'static,
+    {
+        setup_inner::<T, G>(
+            self.nodes,
+            attributes_generator,
+            self.tx_peers,
+            self.disable_gossip,
+            self.flashblocks,
+            self.access_list,
+            self.admin_rpc,
+            self.block_uncompressed_size_limit,
+            self.chain_spec,
+        )
+        .await
+    }
+}
+
 pub async fn setup<T>(
     num_nodes: u8,
     attributes_generator: impl Fn(u64) -> <<WorldChainNode<T> as NodeTypes>::Payload as PayloadTypes>::PayloadAttributes + Send + Sync + Copy + 'static,
@@ -177,19 +260,15 @@ pub async fn setup<T>(
     TxSpammer<<WorldChainNode<T> as NodeTypes>::Payload>,
 )>
 where
-    T: WorldChainTestContextBounds<ChainSpec = OpChainSpec>,
+    T: WorldChainTestContextBounds<ChainSpec = WorldChainSpec>,
     WorldChainNode<T>: WorldChainNodeTestBounds<T>,
 {
-    setup_inner::<T>(
-        num_nodes,
-        attributes_generator,
-        false,
-        false,
-        flashblocks_enabled,
-        None,
-        Arc::new(CHAIN_SPEC.clone()), // default to CHAIN_SPEC
-    )
-    .await
+    WorldChainTestBuilder::builder()
+        .nodes(num_nodes)
+        .flashblocks(flashblocks_enabled)
+        .build()
+        .setup_with::<T, _>(attributes_generator)
+        .await
 }
 
 pub async fn setup_with_block_uncompressed_size_limit<T>(
@@ -197,7 +276,7 @@ pub async fn setup_with_block_uncompressed_size_limit<T>(
     attributes_generator: impl Fn(u64) -> <<WorldChainNode<T> as NodeTypes>::Payload as PayloadTypes>::PayloadAttributes + Send + Sync + Copy + 'static,
     flashblocks_enabled: bool,
     block_uncompressed_size_limit: Option<u64>,
-    chain_spec: Arc<OpChainSpec>,
+    chain_spec: Arc<WorldChainSpec>,
 ) -> eyre::Result<(
     Range<u8>,
     Vec<WorldChainTestingNodeContext<T>>,
@@ -206,19 +285,17 @@ pub async fn setup_with_block_uncompressed_size_limit<T>(
     TxSpammer<<WorldChainNode<T> as NodeTypes>::Payload>,
 )>
 where
-    T: WorldChainTestContextBounds<ChainSpec = OpChainSpec>,
+    T: WorldChainTestContextBounds<ChainSpec = WorldChainSpec>,
     WorldChainNode<T>: WorldChainNodeTestBounds<T>,
 {
-    setup_inner::<T>(
-        num_nodes,
-        attributes_generator,
-        false,
-        false,
-        flashblocks_enabled,
-        block_uncompressed_size_limit,
-        chain_spec,
-    )
-    .await
+    WorldChainTestBuilder::builder()
+        .nodes(num_nodes)
+        .flashblocks(flashblocks_enabled)
+        .maybe_block_uncompressed_size_limit(block_uncompressed_size_limit)
+        .chain_spec(chain_spec)
+        .build()
+        .setup_with::<T, _>(attributes_generator)
+        .await
 }
 
 /// Setup multiple nodes with optional transaction propagation peer configuration
@@ -228,7 +305,7 @@ pub async fn setup_with_tx_peers<T>(
     enable_tx_peers: bool,
     disable_gossip: bool,
     flashblocks_enabled: bool,
-    chain_spec: Arc<OpChainSpec>,
+    chain_spec: Arc<WorldChainSpec>,
 ) -> eyre::Result<(
     Range<u8>,
     Vec<WorldChainTestingNodeContext<T>>,
@@ -237,29 +314,30 @@ pub async fn setup_with_tx_peers<T>(
     TxSpammer<<WorldChainNode<T> as NodeTypes>::Payload>,
 )>
 where
-    T: WorldChainTestContextBounds<ChainSpec = OpChainSpec>,
+    T: WorldChainTestContextBounds<ChainSpec = WorldChainSpec>,
     WorldChainNode<T>: WorldChainNodeTestBounds<T>,
 {
-    setup_inner::<T>(
-        num_nodes,
-        attributes_generator,
-        enable_tx_peers,
-        disable_gossip,
-        flashblocks_enabled,
-        None,
-        chain_spec,
-    )
-    .await
+    WorldChainTestBuilder::builder()
+        .nodes(num_nodes)
+        .flashblocks(flashblocks_enabled)
+        .tx_peers(enable_tx_peers)
+        .disable_gossip(disable_gossip)
+        .chain_spec(chain_spec)
+        .build()
+        .setup_with::<T, _>(attributes_generator)
+        .await
 }
 
-async fn setup_inner<T>(
+async fn setup_inner<T, G>(
     num_nodes: u8,
-    attributes_generator: impl Fn(u64) -> <<WorldChainNode<T> as NodeTypes>::Payload as PayloadTypes>::PayloadAttributes + Send + Sync + Copy + 'static,
+    attributes_generator: G,
     enable_tx_peers: bool,
     disable_gossip: bool,
     flashblocks_enabled: bool,
+    access_list: bool,
+    admin_rpc: bool,
     block_uncompressed_size_limit: Option<u64>,
-    chain_spec: Arc<OpChainSpec>,
+    chain_spec: Arc<WorldChainSpec>,
 ) -> eyre::Result<(
     Range<u8>,
     Vec<WorldChainTestingNodeContext<T>>,
@@ -268,8 +346,13 @@ async fn setup_inner<T>(
     TxSpammer<<WorldChainNode<T> as NodeTypes>::Payload>,
 )>
 where
-    T: WorldChainTestContextBounds<ChainSpec = OpChainSpec>,
+    T: WorldChainTestContextBounds<ChainSpec = WorldChainSpec>,
     WorldChainNode<T>: WorldChainNodeTestBounds<T>,
+    G: Fn(u64) -> <<WorldChainNode<T> as NodeTypes>::Payload as PayloadTypes>::PayloadAttributes
+        + Send
+        + Sync
+        + Copy
+        + 'static,
 {
     unsafe {
         std::env::set_var("PRIVATE_KEY", DEV_WORLD_ID.to_string());
@@ -277,15 +360,20 @@ where
 
     let exec = Runtime::test();
 
-    let mut node_config: NodeConfig<OpChainSpec> = NodeConfig::new(chain_spec.clone())
+    let mut rpc_args = RpcServerArgs::default()
+        .with_unused_ports()
+        .with_auth_unused_port()
+        .with_http_unused_port()
+        .with_http();
+    if admin_rpc {
+        // Expose all standard namespaces (incl. `admin`) so the
+        // `admin_tracingDirectives` endpoint is reachable in tests.
+        rpc_args = rpc_args.with_http_api(RpcModuleSelection::All);
+    }
+
+    let mut node_config: NodeConfig<WorldChainSpec> = NodeConfig::new(chain_spec.clone())
         .with_chain(chain_spec)
-        .with_rpc(
-            RpcServerArgs::default()
-                .with_unused_ports()
-                .with_auth_unused_port()
-                .with_http_unused_port()
-                .with_http(),
-        )
+        .with_rpc(rpc_args)
         .with_payload_builder(PayloadBuilderArgs {
             deadline: Duration::from_secs(12),
             max_payload_tasks: 20,
@@ -329,9 +417,15 @@ where
                 Some(previous_peer_ids),
                 disable_gossip,
                 flashblocks_enabled,
+                access_list,
             )
         } else {
-            test_config_with_peers_and_gossip(None, disable_gossip, flashblocks_enabled)
+            test_config_with_peers_and_gossip(
+                None,
+                disable_gossip,
+                flashblocks_enabled,
+                access_list,
+            )
         };
         let mut config = config;
         config.args.builder.block_uncompressed_size_limit = block_uncompressed_size_limit;
@@ -432,9 +526,10 @@ where
     Ok((0..5, node_contexts, exec, environment, spammer))
 }
 
-pub static CHAIN_SPEC: LazyLock<OpChainSpec> = LazyLock::new(|| {
+pub static CHAIN_SPEC: LazyLock<WorldChainSpec> = LazyLock::new(|| {
     let spec: Genesis = serde_json::from_str(GENESIS).expect("genesis should parse");
-    OpChainSpecBuilder::base_mainnet()
+    WorldChainSpecBuilder::default()
+        .chain(spec.config.chain_id.into())
         .genesis(
             spec.extend_accounts(vec![(
                 DEV_WORLD_ID,
@@ -474,7 +569,7 @@ pub static CHAIN_SPEC: LazyLock<OpChainSpec> = LazyLock::new(|| {
                 GenesisAccount::default().with_balance(U256::from(100_000_000_000_000_000u64)),
             )]),
         )
-        .ecotone_activated()
+        .karst_activated()
         .build()
 });
 
@@ -521,6 +616,7 @@ pub fn build_payload_attributes(
             withdrawals: Some(vec![]),
             parent_beacon_block_root: Some(B256::ZERO),
             slot_number: None,
+            target_gas_limit: None,
         },
         transactions,
         no_tx_pool: Some(false),
@@ -531,6 +627,13 @@ pub fn build_payload_attributes(
             .then_some(0),
     }
     .into()
+}
+
+/// Build default World Chain payload attributes for e2e block production.
+pub fn world_chain_payload_attributes(timestamp: u64) -> OpPayloadAttrs {
+    let eip1559_params =
+        encode_eip1559_params(&*CHAIN_SPEC, timestamp).expect("eip1559 params should encode");
+    build_payload_attributes(timestamp, eip1559_params, None)
 }
 
 /// Encode EIP-1559 parameters for Holocene from a chain spec at a given timestamp
@@ -571,7 +674,7 @@ pub async fn create_test_transaction(signer_index: u32, nonce: u64) -> (Bytes, B
 
 pub fn execution_data_from_from_reduced_flashblock(
     flashblock: Flashblock,
-    spec: Arc<OpChainSpec>,
+    spec: Arc<WorldChainSpec>,
 ) -> OpExecutionData {
     let base = flashblock.base().unwrap();
     let delta = flashblock.diff();

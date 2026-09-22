@@ -1,0 +1,264 @@
+//! Shared range-proof public-value types used by all World fault-proof backends.
+
+use serde::{Deserialize, Serialize};
+
+/// World hardfork activation schedule carried by World range proof inputs.
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+pub struct WorldRangeHardforkConfig {
+    /// Bedrock activation block.
+    #[serde(default, alias = "bedrockBlock")]
+    pub bedrock_block: Option<u64>,
+    /// Regolith activation timestamp.
+    #[serde(default, alias = "regolithTime")]
+    pub regolith_time: Option<u64>,
+    /// Canyon activation timestamp.
+    #[serde(default, alias = "canyonTime")]
+    pub canyon_time: Option<u64>,
+    /// Ecotone activation timestamp.
+    #[serde(default, alias = "ecotoneTime")]
+    pub ecotone_time: Option<u64>,
+    /// Fjord activation timestamp.
+    #[serde(default, alias = "fjordTime")]
+    pub fjord_time: Option<u64>,
+    /// Granite activation timestamp.
+    #[serde(default, alias = "graniteTime")]
+    pub granite_time: Option<u64>,
+    /// Holocene activation timestamp.
+    #[serde(default, alias = "holoceneTime")]
+    pub holocene_time: Option<u64>,
+    /// Isthmus activation timestamp.
+    #[serde(default, alias = "isthmusTime")]
+    pub isthmus_time: Option<u64>,
+    /// Jovian activation timestamp.
+    #[serde(default, alias = "jovianTime")]
+    pub jovian_time: Option<u64>,
+    /// Karst activation timestamp.
+    #[serde(default, alias = "karstTime")]
+    pub karst_time: Option<u64>,
+    /// Tropo activation timestamp. This is a World-only fork.
+    #[serde(default, alias = "tropoTime")]
+    pub tropo_time: Option<u64>,
+    /// Strato activation timestamp. This is a World-only fork.
+    #[serde(default, alias = "stratoTime")]
+    pub strato_time: Option<u64>,
+}
+
+impl WorldRangeHardforkConfig {
+    /// Returns `true` when the fork is active at the given L2 block/timestamp.
+    pub fn is_active(&self, fork: WorldRangeHardfork, block_number: u64, timestamp: u64) -> bool {
+        match fork {
+            // Bedrock is a genesis fork keyed on block number; every other OP Stack fork is
+            // keyed on block timestamp. We treat `bedrock_block = None` as "always active"
+            // (block 0) so chains that never explicitly enable Bedrock still report it as
+            // active, matching the asymmetric semantics in `op-node`.
+            WorldRangeHardfork::Bedrock => block_active(self.bedrock_block, block_number),
+            WorldRangeHardfork::Regolith => timestamp_active(self.regolith_time, timestamp),
+            WorldRangeHardfork::Canyon => timestamp_active(self.canyon_time, timestamp),
+            WorldRangeHardfork::Ecotone => timestamp_active(self.ecotone_time, timestamp),
+            WorldRangeHardfork::Fjord => timestamp_active(self.fjord_time, timestamp),
+            WorldRangeHardfork::Granite => timestamp_active(self.granite_time, timestamp),
+            WorldRangeHardfork::Holocene => timestamp_active(self.holocene_time, timestamp),
+            WorldRangeHardfork::Isthmus => timestamp_active(self.isthmus_time, timestamp),
+            WorldRangeHardfork::Jovian => timestamp_active(self.jovian_time, timestamp),
+            WorldRangeHardfork::Karst => timestamp_active(self.karst_time, timestamp),
+            WorldRangeHardfork::Tropo => timestamp_active(self.tropo_time, timestamp),
+            WorldRangeHardfork::Strato => timestamp_active(self.strato_time, timestamp),
+        }
+    }
+
+    /// Returns the latest active World hardfork at the given L2 block/timestamp.
+    pub fn active_fork_at(&self, block_number: u64, timestamp: u64) -> WorldRangeHardfork {
+        [
+            WorldRangeHardfork::Strato,
+            WorldRangeHardfork::Tropo,
+            WorldRangeHardfork::Karst,
+            WorldRangeHardfork::Jovian,
+            WorldRangeHardfork::Isthmus,
+            WorldRangeHardfork::Holocene,
+            WorldRangeHardfork::Granite,
+            WorldRangeHardfork::Fjord,
+            WorldRangeHardfork::Ecotone,
+            WorldRangeHardfork::Canyon,
+            WorldRangeHardfork::Regolith,
+        ]
+        .into_iter()
+        .find(|fork| self.is_active(*fork, block_number, timestamp))
+        .unwrap_or(WorldRangeHardfork::Bedrock)
+    }
+}
+
+fn timestamp_active(activation: Option<u64>, timestamp: u64) -> bool {
+    activation.is_some_and(|activation| timestamp >= activation)
+}
+
+/// Returns whether a block-number-keyed fork is active at `block`.
+///
+/// Mirrors [`timestamp_active`] but applies the convention that an unset activation
+/// (`None`) is treated as `0`, i.e. always active. Bedrock is the only OP Stack fork
+/// that activates by block number, so it is the sole user of this helper.
+fn block_active(activation: Option<u64>, block: u64) -> bool {
+    block >= activation.unwrap_or(0)
+}
+
+/// World hardfork names used inside range proof public values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorldRangeHardfork {
+    /// Bedrock hardfork.
+    Bedrock,
+    /// Regolith hardfork.
+    Regolith,
+    /// Canyon hardfork.
+    Canyon,
+    /// Ecotone hardfork.
+    Ecotone,
+    /// Fjord hardfork.
+    Fjord,
+    /// Granite hardfork.
+    Granite,
+    /// Holocene hardfork.
+    Holocene,
+    /// Isthmus hardfork.
+    Isthmus,
+    /// Jovian hardfork.
+    Jovian,
+    /// Karst hardfork.
+    Karst,
+    /// Tropo hardfork.
+    Tropo,
+    /// Strato hardfork.
+    Strato,
+}
+
+/// World proof spec id used by the range proof wrapper.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(non_camel_case_types)]
+pub enum WorldRangeSpecId {
+    /// Bedrock spec id.
+    BEDROCK = 100,
+    /// Regolith spec id.
+    REGOLITH,
+    /// Canyon spec id.
+    CANYON,
+    /// Ecotone spec id.
+    ECOTONE,
+    /// Fjord spec id.
+    FJORD,
+    /// Granite spec id.
+    GRANITE,
+    /// Holocene spec id.
+    HOLOCENE,
+    /// Isthmus spec id.
+    ISTHMUS,
+    /// Jovian spec id.
+    JOVIAN,
+    /// Karst spec id.
+    KARST,
+    /// Tropo spec id.
+    TROPO,
+    /// Strato spec id.
+    STRATO,
+}
+
+impl WorldRangeSpecId {
+    /// Converts a World hardfork name to the corresponding proof spec id.
+    pub const fn from_hardfork(hardfork: WorldRangeHardfork) -> Self {
+        match hardfork {
+            WorldRangeHardfork::Bedrock => Self::BEDROCK,
+            WorldRangeHardfork::Regolith => Self::REGOLITH,
+            WorldRangeHardfork::Canyon => Self::CANYON,
+            WorldRangeHardfork::Ecotone => Self::ECOTONE,
+            WorldRangeHardfork::Fjord => Self::FJORD,
+            WorldRangeHardfork::Granite => Self::GRANITE,
+            WorldRangeHardfork::Holocene => Self::HOLOCENE,
+            WorldRangeHardfork::Isthmus => Self::ISTHMUS,
+            WorldRangeHardfork::Jovian => Self::JOVIAN,
+            WorldRangeHardfork::Karst => Self::KARST,
+            WorldRangeHardfork::Tropo => Self::TROPO,
+            WorldRangeHardfork::Strato => Self::STRATO,
+        }
+    }
+}
+
+impl From<WorldRangeSpecId> for &'static str {
+    fn from(spec_id: WorldRangeSpecId) -> Self {
+        match spec_id {
+            WorldRangeSpecId::BEDROCK => "Bedrock",
+            WorldRangeSpecId::REGOLITH => "Regolith",
+            WorldRangeSpecId::CANYON => "Canyon",
+            WorldRangeSpecId::ECOTONE => "Ecotone",
+            WorldRangeSpecId::FJORD => "Fjord",
+            WorldRangeSpecId::GRANITE => "Granite",
+            WorldRangeSpecId::HOLOCENE => "Holocene",
+            WorldRangeSpecId::ISTHMUS => "Isthmus",
+            WorldRangeSpecId::JOVIAN => "Jovian",
+            WorldRangeSpecId::KARST => "Karst",
+            WorldRangeSpecId::TROPO => "Tropo",
+            WorldRangeSpecId::STRATO => "Strato",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parses_snake_and_camel_case_fork_times() {
+        let snake: WorldRangeHardforkConfig = serde_json::from_value(json!({
+            "jovian_time": 10,
+            "karst_time": 20,
+            "tropo_time": 30,
+            "strato_time": 40
+        }))
+        .unwrap();
+        let camel: WorldRangeHardforkConfig = serde_json::from_value(json!({
+            "jovianTime": 10,
+            "karstTime": 20,
+            "tropoTime": 30,
+            "stratoTime": 40
+        }))
+        .unwrap();
+
+        assert_eq!(snake, camel);
+        assert_eq!(snake.karst_time, Some(20));
+        assert_eq!(snake.tropo_time, Some(30));
+        assert_eq!(snake.strato_time, Some(40));
+    }
+
+    #[test]
+    fn activates_karst_tropo_and_strato_in_order() {
+        let config = WorldRangeHardforkConfig {
+            jovian_time: Some(10),
+            karst_time: Some(20),
+            tropo_time: Some(30),
+            strato_time: Some(40),
+            ..Default::default()
+        };
+
+        assert_eq!(config.active_fork_at(1, 19), WorldRangeHardfork::Jovian);
+        assert_eq!(config.active_fork_at(1, 20), WorldRangeHardfork::Karst);
+        assert_eq!(config.active_fork_at(1, 30), WorldRangeHardfork::Tropo);
+        assert_eq!(config.active_fork_at(1, 40), WorldRangeHardfork::Strato);
+        assert_eq!(
+            WorldRangeSpecId::from_hardfork(config.active_fork_at(1, 20)),
+            WorldRangeSpecId::KARST
+        );
+        assert_eq!(
+            WorldRangeSpecId::from_hardfork(config.active_fork_at(1, 40)),
+            WorldRangeSpecId::STRATO
+        );
+    }
+}

@@ -23,8 +23,6 @@ use reth_chainspec::{ChainInfo, MAINNET};
 use reth_db::models::{AccountBeforeTx, StoredBlockBodyIndices};
 use reth_e2e_test_utils::transaction::TransactionTestContext;
 use reth_network_peers::PeerId;
-use reth_optimism_chainspec::OpChainSpec;
-use reth_optimism_node::OpEvmConfig;
 use reth_optimism_payload_builder::config::OpBuilderConfig;
 use reth_optimism_primitives::{OpBlock, OpTransactionSigned};
 use reth_primitives_traits::{
@@ -57,10 +55,12 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::{broadcast, watch};
+use world_chain_chainspec::WorldChainSpec;
 use world_chain_cli::{
     BuilderArgs, FlashblocksPayloadBuilderConfig, PbhArgs, WorldChainArgs, WorldChainNodeConfig,
     cli::{builder::FlashblocksArgs, p2p::FanoutArgs},
 };
+use world_chain_evm::WorldChainEvmConfig;
 use world_chain_pbh::external_nullifier::ExternalNullifier;
 use world_chain_pool::{
     tx::{WorldChainPoolTransaction, WorldChainPooledTransaction},
@@ -69,7 +69,7 @@ use world_chain_pool::{
 use world_chain_primitives::ed25519_dalek::SigningKey;
 
 pub fn test_config() -> WorldChainNodeConfig {
-    test_config_with_peers_and_gossip(None, false, true)
+    test_config_with_peers_and_gossip(None, false, true, true)
 }
 
 /// Creates a test config with optional transaction propagation peers and gossip control
@@ -77,6 +77,7 @@ pub fn test_config_with_peers_and_gossip(
     tx_peers: Option<Vec<PeerId>>,
     disable_txpool_gossip: bool,
     flashblocks_enabled: bool,
+    access_list: bool,
 ) -> WorldChainNodeConfig {
     use reth_optimism_node::args::RollupArgs;
 
@@ -102,7 +103,11 @@ pub fn test_config_with_peers_and_gossip(
             force_publish: false,
             recommit_interval: 200,
             flashblocks_interval: 200,
-            access_list: true,
+            access_list,
+            store: false,
+            store_path: None,
+            sentry_peers: Vec::new(),
+            max_sentry_connections: world_chain_cli::cli::builder::DEFAULT_MAX_SENTRY_CONNECTIONS,
             fanout: FanoutArgs::default(),
         })
     } else {
@@ -120,14 +125,16 @@ pub fn test_config_with_peers_and_gossip(
             builder,
             pbh,
             flashblocks,
+            witness: Default::default(),
             tx_peers,
             disable_bootnodes: true,
             simulate_enabled: false,
         },
         builder_config: FlashblocksPayloadBuilderConfig {
             inner: OpBuilderConfig::default(),
-            bal_enabled: true,
+            bal_enabled: access_list,
         },
+        flashblocks_store: None,
     }
 }
 
@@ -222,11 +229,11 @@ pub fn tx(
 pub struct WorldChainNoopProvider;
 
 impl ChainSpecProvider for WorldChainNoopProvider {
-    type ChainSpec = OpChainSpec;
+    type ChainSpec = WorldChainSpec;
 
-    fn chain_spec(&self) -> Arc<OpChainSpec> {
+    fn chain_spec(&self) -> Arc<WorldChainSpec> {
         let inner = MAINNET.clone().as_ref().to_owned();
-        Arc::new(OpChainSpec::new(inner))
+        Arc::new(WorldChainSpec::new(inner))
     }
 }
 
@@ -744,7 +751,7 @@ pub struct WorldChainNoopValidator<Client, Tx>
 where
     Client: StateProviderFactory + BlockReaderIdExt + Debug,
 {
-    _inner: WorldChainTransactionValidator<Client, Tx, OpEvmConfig>,
+    _inner: WorldChainTransactionValidator<Client, Tx, WorldChainEvmConfig>,
 }
 
 impl WorldChainNoopValidator<WorldChainNoopProvider, WorldChainPooledTransaction> {
@@ -752,7 +759,7 @@ impl WorldChainNoopValidator<WorldChainNoopProvider, WorldChainPooledTransaction
         inner: WorldChainTransactionValidator<
             WorldChainNoopProvider,
             WorldChainPooledTransaction,
-            OpEvmConfig,
+            WorldChainEvmConfig,
         >,
     ) -> Self {
         Self { _inner: inner }

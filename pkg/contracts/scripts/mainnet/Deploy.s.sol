@@ -7,10 +7,13 @@ import {PBHEntryPointImplV1} from "../../src/pbh/PBHEntryPointImplV1.sol";
 import {PBHSignatureAggregator} from "../../src/pbh/PBHSignatureAggregator.sol";
 import {console} from "forge-std/console.sol";
 import {IWorldID} from "@world-id-contracts/interfaces/IWorldID.sol";
-import {IPBHEntryPoint} from "../../src/pbh/interfaces/IPBHEntryPoint.sol";
+import {IPBHEntryPoint} from "../../src/interfaces/IPBHEntryPoint.sol";
 import {IEntryPoint} from "@account-abstraction/contracts/interfaces/IEntryPoint.sol";
 import {Create2Factory} from "./Create2Deploy.sol";
 
+// TODO: add production WIP-1006 proof-system deployment wiring in a dedicated
+// script, including the reusable SP1ValidityVerifier with the Succinct verifier
+// gateway and a game implementation pinned to its aggregation/range vkeys.
 contract Deploy is Create2Factory, Script {
     address public pbhEntryPoint;
     address public pbhEntryPointImpl;

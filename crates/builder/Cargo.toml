@@ -8,21 +8,19 @@ license.workspace = true
 [dependencies]
 # internal 
 world-chain-primitives.workspace = true
-world-chain-p2p.workspace = true
 world-chain-pool.workspace = true
+world-chain-chainspec.workspace = true
+world-chain-evm.workspace = true
 
 # reth
 reth-basic-payload-builder.workspace = true
-reth-chain-state.workspace = true
 reth-chainspec.workspace = true
 reth-provider.workspace = true
 reth-transaction-pool.workspace = true
-reth-trie-common.workspace = true
 reth-payload-primitives.workspace = true
 reth-payload-util.workspace = true
 reth-evm.workspace = true
 reth-node-api.workspace = true
-reth-node-builder.workspace = true
 reth-revm.workspace = true
 reth-primitives-traits.workspace = true
 
@@ -31,8 +29,6 @@ reth-optimism-forks.workspace = true
 reth-optimism-node.workspace = true
 reth-optimism-payload-builder.workspace = true
 reth-optimism-primitives.workspace = true
-reth-optimism-chainspec.workspace = true
-reth-optimism-evm.workspace = true
 
 # alloy
 alloy-consensus.workspace = true
@@ -52,30 +48,18 @@ revm-database.workspace = true
 # op-revm
 op-revm.workspace = true
 
-# tokio
-tokio.workspace = true
-
 semaphore-rs.workspace = true
 
 # misc
 crossbeam-channel.workspace = true
-parking_lot.workspace = true
 tracing.workspace = true
-futures.workspace = true
 eyre.workspace = true
-rayon.workspace = true
-dashmap.workspace = true
-thiserror.workspace = true
-either.workspace = true
 metrics.workspace = true
 metrics-derive.workspace = true
-serde.workspace = true
-auto_impl.workspace = true
 
 [dev-dependencies]
 world-chain-test-utils.workspace = true
 world-chain-builder.workspace = true
-world-chain-p2p = { workspace = true, features = ["test-utils"] }
 world-chain-node.workspace = true
 reth-optimism-node = { workspace = true, features = ["test-utils"] }
 reth-tasks.workspace = true
@@ -83,16 +67,8 @@ serde.workspace = true
 serde_json.workspace = true
 eyre.workspace = true
 reth-tracing.workspace = true
-bon.workspace = true
 criterion.workspace = true
-
-[[bench]]
-name = "flashblock_validation_synthetic"
-harness = false
-
-[[bench]]
-name = "flashblock_validation_live_node"
-harness = false
+tokio.workspace = true
 
 [[bench]]
 name = "flashblock_building_live_node"

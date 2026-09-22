@@ -1,4 +1,6 @@
 target/
+**/target/
+!target/eif/world-chain-proof-nitro-enclave.eif
 .env/
 pkg/contracts/
 assets/

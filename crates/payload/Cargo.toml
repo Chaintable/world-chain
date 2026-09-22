@@ -9,11 +9,12 @@ license.workspace = true
 # internal
 world-chain-primitives.workspace = true
 world-chain-builder.workspace = true
+world-chain-validator.workspace = true
 world-chain-p2p.workspace = true
+world-chain-chainspec.workspace = true
 
 # reth
 reth-basic-payload-builder.workspace = true
-reth-optimism-chainspec.workspace = true
 reth-optimism-node.workspace = true
 reth-optimism-payload-builder.workspace = true
 reth-optimism-primitives.workspace = true
@@ -28,9 +29,7 @@ reth-trie-parallel.workspace = true
 
 # alloy
 alloy-eips.workspace = true
-alloy-consensus.workspace = true
 alloy-primitives.workspace = true
-op-alloy-consensus.workspace = true
 
 # misc
 eyre.workspace = true

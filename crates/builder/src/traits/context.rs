@@ -1,8 +1,6 @@
-use crate::{
-    payload_builder_metrics::PayloadBuildAttemptMetrics, state_db::StateDB,
-    traits::context_builder::PayloadBuilderCtxBuilder, utils::effective_gas_limit,
-};
+use crate::payload_builder_metrics::PayloadBuildAttemptMetrics;
 use alloy_eips::eip4895::Withdrawals;
+use alloy_op_evm::block::PreRefundGasUsed;
 use alloy_primitives::U256;
 use alloy_rpc_types_engine::PayloadId;
 use op_alloy_consensus::EIP1559ParamError;
@@ -10,24 +8,17 @@ use op_revm::OpSpecId;
 use reth_chainspec::EthereumHardforks;
 use reth_evm::{ConfigureEvm, Evm, EvmEnv, block::BlockExecutor, execute::BlockBuilder};
 use reth_node_api::PayloadBuilderError;
-use reth_optimism_chainspec::OpChainSpec;
 use reth_optimism_forks::OpHardforks;
-use reth_optimism_node::{
-    OpEvmConfig,
-    txpool::{OpPooledTransaction, OpPooledTx},
-};
+use reth_optimism_node::txpool::OpPooledTx;
 use reth_optimism_payload_builder::{
-    builder::{ExecutionInfo, OpPayloadBuilderCtx},
-    config::OpBuilderConfig,
-    payload::OpPayloadBuilderAttributes,
+    builder::ExecutionInfo, config::OpBuilderConfig, payload::OpPayloadBuilderAttributes,
 };
-use reth_payload_primitives::BuildNextEnv;
 use reth_payload_util::PayloadTransactions;
-use reth_primitives_traits::{HeaderTy, SealedHeader, TxTy};
-use reth_provider::ChainSpecProvider;
+use reth_primitives_traits::{SealedHeader, TxTy};
 use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction, TransactionPool};
-use revm::{DatabaseCommit, context::BlockEnv};
+use revm::context::BlockEnv;
 use revm_database::State;
+use world_chain_evm::utils::effective_gas_limit;
 
 /// Context trait for building payloads with flashblock support.
 ///
@@ -143,7 +134,7 @@ pub trait PayloadBuilderCtx: Send + Sync {
         &self,
         builder: &mut impl BlockBuilder<
             Primitives = <Self::Evm as ConfigureEvm>::Primitives,
-            Executor: BlockExecutor<Evm: Evm<DB: StateDB + DatabaseCommit + reth_evm::Database>>,
+            Executor: BlockExecutor<Evm: Evm<DB: reth_evm::block::StateDB + reth_evm::Database>>,
         >,
     ) -> Result<ExecutionInfo, PayloadBuilderError>;
 
@@ -166,9 +157,10 @@ pub trait PayloadBuilderCtx: Send + Sync {
                 Primitives = <Self::Evm as ConfigureEvm>::Primitives,
                 Executor: BlockExecutor<
                     Evm: Evm<
-                        DB: StateDB + DatabaseCommit + reth_evm::Database,
+                        DB: reth_evm::block::StateDB + reth_evm::Database,
                         BlockEnv = BlockEnv,
                     >,
+                    Result: PreRefundGasUsed,
                 >,
             >,
         Txs: PayloadTransactions<Transaction = Self::Transaction>;
@@ -182,176 +174,5 @@ pub trait PayloadBuilderCtx: Send + Sync {
         self.spec()
             .is_shanghai_active_at_timestamp(self.attributes().timestamp)
             .then(|| &self.attributes().withdrawals)
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct OpPayloadBuilderCtxBuilder;
-
-impl<Provider> PayloadBuilderCtxBuilder<Provider, OpEvmConfig, OpChainSpec>
-    for OpPayloadBuilderCtxBuilder
-where
-    Provider: ChainSpecProvider<ChainSpec = OpChainSpec>,
-{
-    type PayloadBuilderCtx = OpPayloadBuilderCtx<OpEvmConfig, OpChainSpec>;
-
-    fn build(
-        &self,
-        provider: Provider,
-        evm: OpEvmConfig,
-        builder_config: OpBuilderConfig,
-        config: reth_basic_payload_builder::PayloadConfig<
-            OpPayloadBuilderAttributes<op_alloy_consensus::OpTxEnvelope>,
-            HeaderTy<<OpEvmConfig as ConfigureEvm>::Primitives>,
-        >,
-        cancel: &reth_revm::cancelled::CancelOnDrop,
-        best_payload: Option<reth_optimism_node::OpBuiltPayload>,
-    ) -> Self::PayloadBuilderCtx
-    where
-        Self: Sized,
-    {
-        OpPayloadBuilderCtx {
-            evm_config: evm,
-            builder_config,
-            chain_spec: provider.chain_spec(),
-            config,
-            cancel: cancel.clone(),
-            best_payload,
-        }
-    }
-}
-
-impl PayloadBuilderCtx for OpPayloadBuilderCtx<OpEvmConfig, OpChainSpec> {
-    type Evm = OpEvmConfig;
-    type ChainSpec = OpChainSpec;
-    type Transaction = OpPooledTransaction;
-
-    fn evm_config(&self) -> &Self::Evm {
-        &self.evm_config
-    }
-
-    fn spec(&self) -> &Self::ChainSpec {
-        self.chain_spec.as_ref()
-    }
-
-    fn builder_config(&self) -> &OpBuilderConfig {
-        &self.builder_config
-    }
-
-    fn evm_env(&self) -> Result<EvmEnv<OpSpecId>, EIP1559ParamError> {
-        self.evm_config.evm_env(self.parent())
-    }
-
-    fn parent(&self) -> &SealedHeader {
-        self.parent()
-    }
-
-    fn attributes(
-        &self,
-    ) -> &OpPayloadBuilderAttributes<TxTy<<Self::Evm as ConfigureEvm>::Primitives>> {
-        self.attributes()
-    }
-
-    fn best_transaction_attributes(
-        &self,
-        block_env: &revm::context::BlockEnv,
-    ) -> BestTransactionsAttributes {
-        self.best_transaction_attributes(block_env)
-    }
-
-    fn payload_id(&self) -> PayloadId {
-        self.payload_id()
-    }
-
-    fn is_better_payload(&self, total_fees: U256) -> bool {
-        self.is_better_payload(total_fees)
-    }
-
-    /// Processes user transactions from the mempool until `effective_gas_limit` is reached.
-    ///
-    /// Returns `None` if the parent [`CancelOnDrop`] token was dropped by the [`PayloadJobsGenerator`] type.
-    fn execute_best_transactions<Pool, Txs, Builder>(
-        &self,
-        _pool: Pool,
-        info: &mut ExecutionInfo,
-        builder: &mut Builder,
-        best_txs: Txs,
-        _attempt_metrics: &mut PayloadBuildAttemptMetrics,
-        _effective_gas_limit: u64,
-        _cumulative_uncompressed_bytes: u64,
-    ) -> Result<Option<()>, PayloadBuilderError>
-    where
-        Pool: TransactionPool,
-        Builder: BlockBuilder<
-                Primitives = <Self::Evm as ConfigureEvm>::Primitives,
-                Executor: BlockExecutor<
-                    Evm: Evm<DB: StateDB + DatabaseCommit + reth_evm::Database>,
-                >,
-            >,
-        Txs: PayloadTransactions<Transaction = Self::Transaction>,
-    {
-        self.execute_best_transactions(info, builder, best_txs)
-    }
-
-    /// Determines if validator withdrawals should be processed in this block.
-    ///
-    /// Checks if the Shanghai hardfork is active at the current timestamp, and
-    /// if so, returns the withdrawals specified by the consensus layer. These
-    /// represent validator stake withdrawals that must be processed automatically.
-    fn withdrawals(&self) -> Option<&Withdrawals> {
-        self.spec()
-            .is_shanghai_active_at_timestamp(self.attributes().timestamp)
-            .then(|| &self.attributes().withdrawals)
-    }
-
-    fn block_builder<'a, DB>(
-        &'a self,
-        db: &'a mut State<DB>,
-    ) -> Result<
-        impl BlockBuilder<
-            Primitives = <Self::Evm as ConfigureEvm>::Primitives,
-            Executor: BlockExecutor<Evm: Evm<DB = &'a mut State<DB>, BlockEnv = BlockEnv>>,
-        > + 'a,
-        PayloadBuilderError,
-    >
-    where
-        DB: reth_evm::Database + 'a,
-        DB::Error: Send + Sync + 'static,
-    {
-        {
-            // Requires a manual implementation here because upstream
-            // opaque types don't have sufficient functionality
-            let this = &self;
-            let parent = this.parent();
-            let attributes = <OpEvmConfig as ConfigureEvm>::NextBlockEnvCtx::build_next_env(
-                this.attributes(),
-                this.parent(),
-                this.chain_spec.as_ref(),
-            )
-            .map_err(PayloadBuilderError::other)?;
-
-            let evm_env = this
-                .evm_config
-                .next_evm_env(parent, &attributes)
-                .map_err(PayloadBuilderError::other)?;
-
-            let evm = this.evm_config.evm_with_env(db, evm_env);
-            let ctx = this
-                .evm_config
-                .context_for_next_block(parent, attributes)
-                .map_err(PayloadBuilderError::other)?;
-
-            Ok(this.evm_config.create_block_builder(evm, parent, ctx))
-        }
-    }
-
-    fn execute_sequencer_transactions(
-        &self,
-        builder: &mut impl BlockBuilder<
-            Primitives = <Self::Evm as ConfigureEvm>::Primitives,
-            Executor: BlockExecutor<Evm: Evm<DB: StateDB + DatabaseCommit + reth_evm::Database>>,
-        >,
-    ) -> Result<ExecutionInfo, PayloadBuilderError> {
-        self.execute_sequencer_transactions(builder)
     }
 }

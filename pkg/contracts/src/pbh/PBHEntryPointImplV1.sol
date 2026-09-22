@@ -5,9 +5,9 @@ import {IWorldID} from "@world-id-contracts/interfaces/IWorldID.sol";
 import {IEntryPoint} from "@account-abstraction/contracts/interfaces/IEntryPoint.sol";
 import {PackedUserOperation} from "@account-abstraction/contracts/interfaces/PackedUserOperation.sol";
 import {UserOperationLib} from "@account-abstraction/contracts/core/UserOperationLib.sol";
-import {IPBHEntryPoint} from "./interfaces/IPBHEntryPoint.sol";
-import {ByteHasher} from "./libraries/ByteHasher.sol";
-import {PBHExternalNullifier} from "./libraries/PBHExternalNullifier.sol";
+import {IPBHEntryPoint} from "../interfaces/IPBHEntryPoint.sol";
+import {ByteHasher} from "../lib/ByteHasher.sol";
+import {PBHExternalNullifier} from "../lib/PBHExternalNullifier.sol";
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import "@BokkyPooBahsDateTimeLibrary/BokkyPooBahsDateTimeLibrary.sol";
 import {Base} from "../abstract/Base.sol";
@@ -280,7 +280,8 @@ contract PBHEntryPointImplV1 is IPBHEntryPoint, Base, ReentrancyGuardTransient {
                 // We now generate the signal hash from the sender, nonce, and calldata
                 uint256 signalHash = abi.encodePacked(
                         sender, opsPerAggregator[i].userOps[j].nonce, opsPerAggregator[i].userOps[j].callData
-                    ).hashToField();
+                    )
+                    .hashToField();
 
                 _verifyPbh(signalHash, pbhPayloads[j]);
                 bytes32 userOpHash = getUserOpHash(opsPerAggregator[i].userOps[j]);
@@ -375,6 +376,9 @@ contract PBHEntryPointImplV1 is IPBHEntryPoint, Base, ReentrancyGuardTransient {
     function getFirstUnspentNullifierHash(uint256[] calldata hashes) public view virtual returns (int256) {
         for (uint256 i = 0; i < hashes.length; ++i) {
             if (nullifierHashes[hashes[i]] == 0) {
+                // casting to 'int256' is safe because `i` is bounded by `hashes.length`, which
+                // the calldata size limit keeps far below `type(int256).max`
+                // forge-lint: disable-next-line(unsafe-typecast)
                 return int256(i);
             }
         }

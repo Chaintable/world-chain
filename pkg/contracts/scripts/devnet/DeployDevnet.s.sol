@@ -8,7 +8,7 @@ import {PBHSignatureAggregator} from "../../src/pbh/PBHSignatureAggregator.sol";
 import {console} from "forge-std/console.sol";
 import {EntryPoint} from "@account-abstraction/contracts/core/EntryPoint.sol";
 import {IWorldID} from "@world-id-contracts/interfaces/IWorldID.sol";
-import {IPBHEntryPoint} from "../../src/pbh/interfaces/IPBHEntryPoint.sol";
+import {IPBHEntryPoint} from "../../src/interfaces/IPBHEntryPoint.sol";
 import {IEntryPoint} from "@account-abstraction/contracts/interfaces/IEntryPoint.sol";
 import {Safe} from "@safe-global/safe-contracts/contracts/Safe.sol";
 import {SafeProxyFactory} from "@safe-global/safe-contracts/contracts/proxies/SafeProxyFactory.sol";

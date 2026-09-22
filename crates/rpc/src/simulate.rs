@@ -1,5 +1,5 @@
-use alloy_consensus::BlockHeader;
-use alloy_op_evm::{OpEvmFactory, OpTx};
+use alloy_consensus::{Block, BlockBody, BlockHeader, Header};
+use alloy_op_evm::OpTx;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_rpc_types::{BlockId, BlockNumberOrTag};
 use jsonrpsee::{
@@ -7,15 +7,16 @@ use jsonrpsee::{
     proc_macros::rpc,
 };
 use lru::LruCache;
-use op_revm::{OpSpecId, OpTransaction};
-use reth_evm::{ConfigureEvm, Evm as RethEvm, EvmFactory};
-use reth_optimism_evm::OpEvmConfig;
+use op_revm::OpTransaction;
+use reth_evm::{ConfigureEvm, Evm as RethEvm, EvmFactory, block::BlockExecutorFactory};
+use reth_optimism_primitives::OpReceipt;
+use reth_primitives_traits::{FullSignedTx, NodePrimitives};
 use reth_provider::{BlockReaderIdExt, HeaderProvider, StateProviderFactory};
 use reth_revm::{State, database::StateProviderDatabase};
 use reth_rpc_eth_api::helpers::SpawnBlocking;
 use reth_tasks::pool::{BlockingTaskGuard, BlockingTaskPool};
 use revm::{
-    Inspector,
+    Database, DatabaseCommit, Inspector,
     context::{
         CfgEnv, TxEnv,
         result::{ExecutionResult, Output},
@@ -25,10 +26,14 @@ use revm::{
 use revm_primitives::TxKind;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::{BTreeMap, HashSet},
+    fmt::Debug,
     num::NonZeroUsize,
     sync::{Arc, Mutex},
-    time::Duration,
 };
+use world_chain_evm::WorldChainEvmConfig;
+
+use crate::simulate_consts::*;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Request types
@@ -48,10 +53,10 @@ pub struct SimulateUnsignedUserOpRequest {
     /// Must not exceed `MAX_SIMULATION_GAS`.
     #[serde(default)]
     pub call_gas_limit: Option<U256>,
+    /// Block to simulate against. Defaults to `latest` when omitted.
+    #[serde(default)]
+    pub block: Option<BlockId>,
 }
-
-/// Maximum gas limit accepted for a simulated call.
-pub const MAX_SIMULATION_GAS: u64 = 8_000_000;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Response types
@@ -110,15 +115,71 @@ pub struct ExposureChange {
     pub asset: AssetInfo,
 }
 
-/// A call made during execution, forming a full stack trace.
+/// Kind of EVM frame represented by a trace entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TraceKind {
+    Call,
+    CallCode,
+    DelegateCall,
+    StaticCall,
+    Create,
+    Create2,
+}
+
+/// Outcome of a completed EVM trace frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TraceOutcome {
+    Success,
+    Revert,
+    Halt,
+}
+
+/// A call or contract creation made during execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TraceEntry {
+    pub kind: TraceKind,
     pub from: Address,
-    pub to: Address,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<Address>,
     pub method: Option<String>,
-    pub selector: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
     pub value: String,
+    pub depth: usize,
+    pub outcome: TraceOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revert_reason: Option<String>,
+}
+
+/// Type of contract-management state change detected during simulation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ContractManagementType {
+    ContractCreation,
+    SelfDestruct,
+    ProxyUpgrade,
+    OwnershipChange,
+    ModuleChange,
+    /// EIP-7702 delegation. Reserved — not yet detected.
+    Authorization,
+}
+
+/// One contract-management action against a single target contract.
+///
+/// The `target` (the contract that was created/destroyed/upgraded/etc.) is
+/// the **map key** in `SimulateUnsignedUserOpResult.contract_management` —
+/// not a field on this struct.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractManagementAction {
+    #[serde(rename = "type")]
+    pub action_type: ContractManagementType,
+    /// Address that initiated the CREATE/CREATE2 — populated only for
+    /// `CONTRACT_CREATION`. Omitted from JSON otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployer_address: Option<Address>,
 }
 
 /// Outcome of the simulation execution.
@@ -134,16 +195,21 @@ pub enum SimulationStatus {
 #[serde(rename_all = "camelCase")]
 pub struct SimulateUnsignedUserOpResult {
     pub status: SimulationStatus,
-    /// Decoded reason for a top-level revert/halt; `None` on success.
-    /// For nested reverts this is the *deepest* reverted frame's payload
-    /// (the root cause), not the outermost — important for ERC-4337 where
-    /// EntryPoint always wraps inner reverts in `FailedOp(...)`.
+    /// Best-effort decoded explanation of the execution failure; `None` on
+    /// success.
     pub revert_reason: Option<String>,
     pub block_number: u64,
     pub gas_used: String,
     pub asset_changes: Vec<AssetChange>,
     pub exposure_changes: Vec<ExposureChange>,
     pub trace: Vec<TraceEntry>,
+    /// Contract-management state changes detected during execution, keyed
+    /// by the **target contract address** (the contract created, destroyed,
+    /// upgraded, or whose ownership/modules changed).
+    #[serde(rename = "contract_management")]
+    // BTreeMap so JSON key order is deterministic — snapshot tests, response
+    // signing, and debugging all benefit from stable ordering.
+    pub contract_management: BTreeMap<Address, Vec<ContractManagementAction>>,
     /// Warning generation is not yet implemented. Always serialized as `[]`;
     /// reserved so callers can rely on the field being present.
     pub warnings: Vec<serde_json::Value>,
@@ -155,10 +221,19 @@ pub struct SimulateUnsignedUserOpResult {
 
 #[derive(Debug)]
 struct RawTrace {
+    kind: TraceKind,
     from: Address,
-    to: Address,
-    selector: [u8; 4],
+    to: Option<Address>,
+    selector: Option<[u8; 4]>,
     value: U256,
+    depth: usize,
+    /// Populated by the matching `call_end` or `create_end` hook.
+    outcome: Option<TraceOutcome>,
+    /// Populated by the matching end hook for an explicit REVERT with a
+    /// non-empty payload.
+    revert_output: Option<Bytes>,
+    /// Populated by the matching end hook for an exceptional EVM halt.
+    halt_reason: Option<InstructionResult>,
 }
 
 #[derive(Debug)]
@@ -168,6 +243,36 @@ struct NativeTransfer {
     value: U256,
 }
 
+/// `(deployer, deployed_address)` for a successful CREATE/CREATE2.
+type ContractCreation = (Address, Address);
+
+/// One frame's tentative side-effects. Each CALL or CREATE pushes a fresh
+/// frame on entry; on successful exit it's merged into the parent (or
+/// committed to the inspector's final lists if outermost). On revert/halt
+/// it's dropped — exactly mirroring the EVM's own state-revert semantics
+/// so we never report effects that didn't actually land.
+#[derive(Debug)]
+struct PendingFrame {
+    native_transfers: Vec<NativeTransfer>,
+    /// CREATE/CREATE2 deployments inside this frame.
+    contract_creations: Vec<ContractCreation>,
+    /// Addresses that executed SELFDESTRUCT inside this frame.
+    self_destructs: Vec<Address>,
+    /// Index of this frame's entry in [`SimulationInspector::traces`].
+    trace_index: usize,
+}
+
+impl PendingFrame {
+    fn new(trace_index: usize) -> Self {
+        Self {
+            native_transfers: Vec::new(),
+            contract_creations: Vec::new(),
+            self_destructs: Vec::new(),
+            trace_index,
+        }
+    }
+}
+
 /// Captures the call stack and native ETH transfers of a single simulation.
 ///
 /// Single-threaded by construction — the EVM drives it from one call site,
@@ -175,36 +280,53 @@ struct NativeTransfer {
 /// returns. No interior mutability needed.
 #[derive(Debug, Default)]
 pub struct SimulationInspector {
-    /// Full call stack trace — every CALL/STATICCALL/DELEGATECALL at every depth.
-    /// Includes reverted calls so debug consumers can see what was attempted.
+    /// Full frame trace — every CALL-family and CREATE-family operation at
+    /// every depth. Includes reverted frames so debug consumers can see what
+    /// was attempted.
     traces: Vec<RawTrace>,
-    /// Native ETH transfers from successfully completed call frames only.
-    /// Reverted/halted frames don't actually move ETH, so their tentative
-    /// entries in `pending_frames` are dropped instead of being committed here.
+    /// Native ETH transfers committed by successful frames.
     native_transfers: Vec<NativeTransfer>,
-    /// One entry per active call frame, holding tentative native transfers
-    /// recorded on entry. On `call_end` the frame is popped: committed (or
-    /// merged into the parent frame) on success, dropped on revert/halt.
-    pending_frames: Vec<Vec<NativeTransfer>>,
-    /// Raw payload of the deepest frame that exited via REVERT. Set on the
-    /// first non-ok `call_end` whose `InstructionResult` is `Revert` — since
-    /// `call_end` fires bottom-up, that's the innermost reverter and so the
-    /// root cause when wrappers like EntryPoint's `FailedOp(...)` re-revert
-    /// up the stack. Halt frames (OOG, invalid opcode, etc.) are skipped:
-    /// they have no payload to decode.
-    deepest_revert_payload: Option<Bytes>,
+    /// CREATE/CREATE2 deployments committed by successful frames.
+    contract_creations: Vec<ContractCreation>,
+    /// SELFDESTRUCT calls committed by successful frames.
+    self_destructs: Vec<Address>,
+    /// Active frame stack. Each CALL or CREATE pushes a new entry; the
+    /// matching `*_end` pops it. See [`PendingFrame`].
+    pending_frames: Vec<PendingFrame>,
+    /// Internal frame-bookkeeping failure. Inspector hooks cannot return an
+    /// error to revm, so defer it until the caller collects the trace.
+    trace_error: Option<&'static str>,
 }
 
 impl SimulationInspector {
-    pub fn take_trace_entries(&mut self) -> Vec<TraceEntry> {
-        std::mem::take(&mut self.traces)
-            .into_iter()
-            .map(|t| TraceEntry {
-                from: t.from,
-                to: t.to,
-                method: selector_to_name(t.selector).map(str::to_string),
-                selector: format!("0x{}", hex::encode(t.selector)),
-                value: format!("{:#x}", t.value),
+    pub fn trace_entries(&self) -> Result<Vec<TraceEntry>, &'static str> {
+        if let Some(error) = self.trace_error {
+            return Err(error);
+        }
+
+        self.traces
+            .iter()
+            .map(|t| {
+                let outcome = t
+                    .outcome
+                    .ok_or("simulation inspector trace frame did not complete")?;
+                Ok(TraceEntry {
+                    kind: t.kind,
+                    from: t.from,
+                    to: t.to,
+                    method: t.selector.and_then(selector_to_name).map(str::to_string),
+                    selector: t
+                        .selector
+                        .map(|selector| format!("0x{}", hex::encode(selector))),
+                    value: format!("{:#x}", t.value),
+                    depth: t.depth,
+                    outcome,
+                    revert_reason: t
+                        .revert_output
+                        .as_ref()
+                        .map(decode_revert_reason)
+                        .or_else(|| t.halt_reason.map(|reason| format!("{reason:?}"))),
+                })
             })
             .collect()
     }
@@ -229,12 +351,189 @@ impl SimulationInspector {
             .collect()
     }
 
-    /// Take the decoded reason of the deepest reverted frame, if any.
-    pub fn take_deepest_revert_reason(&mut self) -> Option<String> {
-        self.deepest_revert_payload
-            .take()
-            .map(|output| decode_revert_reason(&output))
+    /// Decoded reason from the terminally failing frame path, if any.
+    pub fn terminal_revert_reason(&self) -> Option<String> {
+        terminal_failure(&self.traces).map(|failure| match failure {
+            FrameFailure::Revert(output) => decode_revert_reason(output),
+            FrameFailure::Halt(reason) => format!("{reason:?}"),
+        })
     }
+
+    /// Drain captured CREATE/CREATE2 deployments. Each entry is
+    /// `(deployer_address, deployed_address)`. Only successful, committed
+    /// creates are returned — frames that locally succeeded but were rolled
+    /// back by a reverting parent are dropped.
+    pub fn take_contract_creations(&mut self) -> Vec<ContractCreation> {
+        std::mem::take(&mut self.contract_creations)
+    }
+
+    /// Drain captured SELFDESTRUCT calls. Same commit semantics as
+    /// [`Self::take_contract_creations`].
+    pub fn take_self_destructs(&mut self) -> Vec<Address> {
+        std::mem::take(&mut self.self_destructs)
+    }
+
+    /// Merge a successful frame into its parent's pending list, or commit
+    /// it to the inspector's final lists if there's no parent.
+    fn commit_or_bubble(&mut self, frame: PendingFrame) {
+        if let Some(parent) = self.pending_frames.last_mut() {
+            parent.native_transfers.extend(frame.native_transfers);
+            parent.contract_creations.extend(frame.contract_creations);
+            parent.self_destructs.extend(frame.self_destructs);
+        } else {
+            self.native_transfers.extend(frame.native_transfers);
+            self.contract_creations.extend(frame.contract_creations);
+            self.self_destructs.extend(frame.self_destructs);
+        }
+    }
+
+    /// Record the outcome of an exiting frame on its trace entry.
+    fn record_trace_outcome(
+        &mut self,
+        trace_index: usize,
+        result: &InstructionResult,
+        output: &Bytes,
+    ) -> Option<&mut RawTrace> {
+        let Some(trace) = self.traces.get_mut(trace_index) else {
+            self.trace_error
+                .get_or_insert("simulation inspector frame referenced a missing trace entry");
+            return None;
+        };
+
+        let outcome = if result.is_ok() {
+            TraceOutcome::Success
+        } else if matches!(result, InstructionResult::Revert) {
+            TraceOutcome::Revert
+        } else {
+            TraceOutcome::Halt
+        };
+        trace.outcome = Some(outcome);
+        if matches!(result, InstructionResult::Revert) && !output.is_empty() {
+            trace.revert_output = Some(output.clone());
+        } else if outcome == TraceOutcome::Halt {
+            trace.halt_reason = Some(*result);
+        }
+
+        Some(trace)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameFailure<'a> {
+    Revert(&'a Bytes),
+    Halt(InstructionResult),
+}
+
+/// Best explanation of the failure that caused the whole simulation to fail,
+/// selected from the completed trace.
+///
+/// The trace is a pre-order flattening of the call tree (entries appear in
+/// call order, parents before their children), so `depth` alone recovers the
+/// tree shape. Selection is [`frame_failure`] applied to the root frame.
+fn terminal_failure(traces: &[RawTrace]) -> Option<FrameFailure<'_>> {
+    if traces.is_empty() {
+        return None;
+    }
+    frame_failure(traces, 0)
+}
+
+/// Best failure attributable to the frame at `index`:
+///
+/// - A successful frame explains nothing.
+/// - A halted frame contributes its EVM instruction result.
+/// - A reverted frame's own non-empty payload wins — it is the terminal
+///   failure at that level — except Safe4337Module's bare `ExecutionFailed()`
+///   from an `executeUserOp` frame, which deliberately replaces the revert
+///   or halt its Safe call caught; recover that via [`safe_execution_failure`].
+/// - An empty revert inherits from its last child if that child also failed.
+///   Earlier failed siblings were superseded by whatever ran after them.
+fn frame_failure(traces: &[RawTrace], index: usize) -> Option<FrameFailure<'_>> {
+    let mut current = index;
+    loop {
+        let frame = &traces[current];
+        match frame.outcome {
+            Some(TraceOutcome::Success) | None => return None,
+            Some(TraceOutcome::Halt) => {
+                return frame.halt_reason.map(FrameFailure::Halt);
+            }
+            Some(TraceOutcome::Revert) => {}
+        }
+        match &frame.revert_output {
+            Some(output)
+                if output.as_ref() == EXECUTION_FAILED_SELECTOR
+                    && frame.selector == Some(EXECUTE_USER_OP_SELECTOR) =>
+            {
+                return safe_execution_failure(traces, current)
+                    .or(Some(FrameFailure::Revert(output)));
+            }
+            Some(output) => return Some(FrameFailure::Revert(output)),
+            None => current = last_direct_child(traces, current)?,
+        }
+    }
+}
+
+/// Failure caught by a successful Safe `execTransactionFromModule` call below
+/// the `executeUserOp` frame. Proxy and delegatecall layers may produce more
+/// than one matching frame; the first contains the others and the target.
+fn safe_execution_failure(traces: &[RawTrace], index: usize) -> Option<FrameFailure<'_>> {
+    let frame_depth = traces[index].depth;
+    for (descendant, trace) in traces.iter().enumerate().skip(index + 1) {
+        if trace.depth <= frame_depth {
+            break;
+        }
+        if trace.outcome == Some(TraceOutcome::Success)
+            && trace.selector == Some(EXEC_TRANSACTION_FROM_MODULE_SELECTOR)
+        {
+            return safe_transaction_failure(traces, descendant);
+        }
+    }
+    None
+}
+
+/// Failure of the target call made by `execTransactionFromModule`.
+///
+/// Proxy and delegatecall layers preserve the selector, so cross only those
+/// successful wrapper frames. At the implementation frame, the failed direct
+/// child is the target call that made Safe return `false`. Other successful
+/// children may be module-guard callbacks; their internally caught reverts do
+/// not explain `ExecutionFailed()`.
+fn safe_transaction_failure(traces: &[RawTrace], index: usize) -> Option<FrameFailure<'_>> {
+    let parent_depth = traces[index].depth;
+    for (child, trace) in traces.iter().enumerate().skip(index + 1) {
+        if trace.depth <= parent_depth {
+            break;
+        }
+        if trace.depth == parent_depth + 1 {
+            if trace.outcome == Some(TraceOutcome::Success)
+                && trace.selector == Some(EXEC_TRANSACTION_FROM_MODULE_SELECTOR)
+            {
+                if let Some(candidate) = safe_transaction_failure(traces, child) {
+                    return Some(candidate);
+                }
+            } else if matches!(
+                trace.outcome,
+                Some(TraceOutcome::Revert | TraceOutcome::Halt)
+            ) {
+                return frame_failure(traces, child);
+            }
+        }
+    }
+    None
+}
+
+/// Index of the last direct child of the frame at `parent`, if any.
+fn last_direct_child(traces: &[RawTrace], parent: usize) -> Option<usize> {
+    let parent_depth = traces[parent].depth;
+    let mut last = None;
+    for (index, trace) in traces.iter().enumerate().skip(parent + 1) {
+        if trace.depth <= parent_depth {
+            break;
+        }
+        if trace.depth == parent_depth + 1 {
+            last = Some(index);
+        }
+    }
+    last
 }
 
 impl<CTX: revm::context_interface::ContextTr> Inspector<CTX> for SimulationInspector {
@@ -264,22 +563,34 @@ impl<CTX: revm::context_interface::ContextTr> Inspector<CTX> for SimulationInspe
             }
             _ => [0u8; 4],
         };
+        let trace_index = self.traces.len();
+        let depth = self.pending_frames.len();
         let value = inputs.value.transfer().unwrap_or(U256::ZERO);
         self.traces.push(RawTrace {
+            kind: match inputs.scheme {
+                revm::interpreter::CallScheme::Call => TraceKind::Call,
+                revm::interpreter::CallScheme::CallCode => TraceKind::CallCode,
+                revm::interpreter::CallScheme::DelegateCall => TraceKind::DelegateCall,
+                revm::interpreter::CallScheme::StaticCall => TraceKind::StaticCall,
+            },
             from: inputs.caller,
-            to: inputs.target_address,
-            selector,
+            to: Some(inputs.target_address),
+            selector: Some(selector),
             value,
+            depth,
+            outcome: None,
+            revert_output: None,
+            halt_reason: None,
         });
 
-        // Open a new frame for tentative native transfers. If this call frame
-        // reverts, `call_end` will drop the frame; only successful frames
-        // commit their transfers.
-        let mut frame = Vec::new();
+        // Open a new frame. If this call reverts, `call_end` will drop the
+        // frame and all its tentative effects (native transfers, creates,
+        // selfdestructs). Only successful frames commit.
+        let mut frame = PendingFrame::new(trace_index);
         if let Some(value) = inputs.value.transfer()
             && value > U256::ZERO
         {
-            frame.push(NativeTransfer {
+            frame.native_transfers.push(NativeTransfer {
                 from: inputs.caller,
                 to: inputs.target_address,
                 value,
@@ -292,28 +603,87 @@ impl<CTX: revm::context_interface::ContextTr> Inspector<CTX> for SimulationInspe
 
     fn call_end(&mut self, _context: &mut CTX, _inputs: &CallInputs, outcome: &mut CallOutcome) {
         let Some(frame) = self.pending_frames.pop() else {
+            self.trace_error
+                .get_or_insert("simulation inspector CALL ended without a pending frame");
             return;
         };
         let result = outcome.instruction_result();
+        self.record_trace_outcome(frame.trace_index, result, outcome.output());
         if !result.is_ok() {
-            // Frame reverted or halted — drop tentative native transfers
-            // either way. For explicit REVERTs, capture the deepest payload
-            // (the first one we see, since `call_end` fires bottom-up) so
-            // wrappers like EntryPoint's `FailedOp(...)` don't mask the
-            // root cause. Halts and the other `is_revert()` variants
-            // (CallTooDeep, OutOfFunds, EOF init-code) have empty outputs.
-            if matches!(result, InstructionResult::Revert) && self.deepest_revert_payload.is_none()
-            {
-                self.deepest_revert_payload = Some(outcome.output().clone());
-            }
+            // Frame reverted or halted — drop everything tentative inside it.
             return;
         }
-        // Successful frame: bubble transfers up to the parent's tentative list,
-        // or commit them as final if this was the outermost frame.
-        if let Some(parent) = self.pending_frames.last_mut() {
-            parent.extend(frame);
+        self.commit_or_bubble(frame);
+    }
+
+    fn create(
+        &mut self,
+        _context: &mut CTX,
+        inputs: &mut revm::interpreter::CreateInputs,
+    ) -> Option<revm::interpreter::CreateOutcome> {
+        // Mirror `call`: every CREATE/CREATE2 gets a trace entry and its own
+        // frame so a parent revert rolls the deployment back atomically with
+        // everything else that ran inside its constructor.
+        let trace_index = self.traces.len();
+        self.traces.push(RawTrace {
+            kind: match inputs.scheme() {
+                revm::context_interface::CreateScheme::Create
+                | revm::context_interface::CreateScheme::Custom { .. } => TraceKind::Create,
+                revm::context_interface::CreateScheme::Create2 { .. } => TraceKind::Create2,
+            },
+            from: inputs.caller(),
+            to: None,
+            selector: None,
+            value: inputs.value(),
+            depth: self.pending_frames.len(),
+            outcome: None,
+            revert_output: None,
+            halt_reason: None,
+        });
+        self.pending_frames.push(PendingFrame::new(trace_index));
+        None
+    }
+
+    fn create_end(
+        &mut self,
+        _context: &mut CTX,
+        inputs: &revm::interpreter::CreateInputs,
+        outcome: &mut revm::interpreter::CreateOutcome,
+    ) {
+        let Some(mut frame) = self.pending_frames.pop() else {
+            self.trace_error
+                .get_or_insert("simulation inspector CREATE ended without a pending frame");
+            return;
+        };
+        let result = outcome.instruction_result();
+        if let Some(trace) = self.record_trace_outcome(frame.trace_index, result, outcome.output())
+            && result.is_ok()
+        {
+            trace.to = outcome.address;
+        }
+        if !result.is_ok() {
+            // CREATE itself failed — drop the frame.
+            return;
+        }
+        // Successful create: record `(deployer, deployed)` into the create
+        // frame so it rolls back atomically with anything its constructor did,
+        // then bubble the frame up to the parent.
+        if let Some(addr) = outcome.address {
+            frame.contract_creations.push((inputs.caller(), addr));
+        }
+        self.commit_or_bubble(frame);
+    }
+
+    fn selfdestruct(&mut self, contract: Address, _target: Address, _value: U256) {
+        // SELFDESTRUCT runs inside the current call frame and is rolled
+        // back along with it on revert. Record into the topmost pending
+        // frame so the existing commit-or-drop machinery handles rollback.
+        if let Some(top) = self.pending_frames.last_mut() {
+            top.self_destructs.push(contract);
         } else {
-            self.native_transfers.extend(frame);
+            // No frame — outermost transact direct to a SELFDESTRUCTing
+            // contract (rare but legal). Commit immediately.
+            self.self_destructs.push(contract);
         }
     }
 }
@@ -342,19 +712,8 @@ pub trait SimulateApi {
 
 /// Maximum number of token metadata entries kept across requests.
 ///
-/// Bounded to prevent unbounded memory growth from adversarial UserOps that
-/// emit Transfer events from many fresh token contracts.
-const METADATA_CACHE_CAPACITY: usize = 1000;
-
 /// Cross-request cache for resolved token metadata. LRU-bounded.
 type MetadataCache = Arc<Mutex<LruCache<Address, AssetInfo>>>;
-
-/// Hard wall-clock cap on a single simulation, observed by the client. Beyond
-/// this we return `internal error: simulation deadline exceeded`. The blocking
-/// task continues to drain on the rayon pool until the EVM finishes (bounded
-/// by `MAX_SIMULATION_GAS`), holding its concurrency permit until then so the
-/// guard correctly accounts for slow simulations.
-pub const SIMULATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Relax EVM rules so simulations succeed regardless of the caller's gas
 /// pricing, balance, or block limits — matching `eth_call` semantics. The
@@ -366,7 +725,7 @@ pub const SIMULATION_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Exposed so fork-based integration tests can mirror the exact prod cfg
 /// instead of redeclaring the flag list (which silently drifts).
-pub fn relax_cfg_for_simulation(cfg_env: &mut CfgEnv<OpSpecId>) {
+pub fn relax_cfg_for_simulation<Spec>(cfg_env: &mut CfgEnv<Spec>) {
     cfg_env.disable_block_gas_limit = true;
     cfg_env.disable_eip3607 = true;
     cfg_env.disable_base_fee = true;
@@ -381,9 +740,9 @@ pub fn relax_cfg_for_simulation(cfg_env: &mut CfgEnv<OpSpecId>) {
 
 /// Implementation of the `simulate_unsignedUserOp` RPC endpoint.
 #[derive(Debug, Clone)]
-pub struct Simulate<Client> {
+pub struct Simulate<Client, EvmConfig = WorldChainEvmConfig> {
     client: Client,
-    evm_config: OpEvmConfig,
+    evm_config: EvmConfig,
     metadata_cache: MetadataCache,
     /// Shared with `eth_call` / `debug_*` so simulate inherits the same
     /// CPU-bound rayon pool and doesn't compete with general tokio work.
@@ -393,10 +752,10 @@ pub struct Simulate<Client> {
     task_guard: BlockingTaskGuard,
 }
 
-impl<Client> Simulate<Client> {
+impl<Client, EvmConfig> Simulate<Client, EvmConfig> {
     pub fn new(
         client: Client,
-        evm_config: OpEvmConfig,
+        evm_config: EvmConfig,
         task_pool: BlockingTaskPool,
         task_guard: BlockingTaskGuard,
     ) -> Self {
@@ -416,7 +775,7 @@ impl<Client> Simulate<Client> {
     /// already-installed eth API.
     pub fn from_eth_api<E: SpawnBlocking>(
         client: Client,
-        evm_config: OpEvmConfig,
+        evm_config: EvmConfig,
         eth_api: &E,
     ) -> Self {
         Self::new(
@@ -429,15 +788,28 @@ impl<Client> Simulate<Client> {
 }
 
 #[async_trait]
-impl<Client> SimulateApiServer for Simulate<Client>
+impl<Client, EvmConfig, N, Tx> SimulateApiServer for Simulate<Client, EvmConfig>
 where
     Client: BlockReaderIdExt
         + StateProviderFactory
-        + HeaderProvider<Header = alloy_consensus::Header>
+        + HeaderProvider<Header = Header>
         + Clone
         + Send
         + Sync
         + 'static,
+    EvmConfig: ConfigureEvm<Primitives = N> + Clone + Send + Sync + Unpin + 'static,
+    <EvmConfig::BlockExecutorFactory as BlockExecutorFactory>::EvmFactory: EvmFactory<Tx = OpTx>,
+    N: NodePrimitives<
+            Receipt = OpReceipt,
+            SignedTx = Tx,
+            BlockHeader = Header,
+            BlockBody = BlockBody<Tx>,
+            Block = Block<Tx>,
+        > + Send
+        + Sync
+        + Unpin
+        + 'static,
+    Tx: FullSignedTx,
 {
     async fn simulate_unsigned_user_op(
         &self,
@@ -476,26 +848,36 @@ where
     }
 }
 
-impl<Client> Simulate<Client>
+impl<Client, EvmConfig, N, Tx> Simulate<Client, EvmConfig>
 where
-    Client:
-        BlockReaderIdExt + StateProviderFactory + HeaderProvider<Header = alloy_consensus::Header>,
+    Client: BlockReaderIdExt + StateProviderFactory + HeaderProvider<Header = Header>,
+    EvmConfig: ConfigureEvm<Primitives = N>,
+    <EvmConfig::BlockExecutorFactory as BlockExecutorFactory>::EvmFactory: EvmFactory<Tx = OpTx>,
+    N: NodePrimitives<
+            Receipt = OpReceipt,
+            SignedTx = Tx,
+            BlockHeader = Header,
+            BlockBody = BlockBody<Tx>,
+            Block = Block<Tx>,
+        >,
+    Tx: FullSignedTx,
 {
     fn simulate_blocking(
         &self,
         request: SimulateUnsignedUserOpRequest,
     ) -> RpcResult<SimulateUnsignedUserOpResult> {
-        // 1. Resolve the latest sealed header. Subsequent lookups go by its
-        //    concrete hash so a new block arriving mid-request can't desync
-        //    the header from the state we read.
+        // 1. Resolve the requested sealed header (defaulting to latest).
+        //    Subsequent lookups go by its concrete hash so a new block arriving
+        //    mid-request can't desync the header from the state we read.
+        let requested_block = request.block.unwrap_or(BlockNumberOrTag::Latest.into());
         let header = self
             .client
-            .sealed_header_by_id(BlockNumberOrTag::Latest.into())
+            .sealed_header_by_id(requested_block)
             .map_err(internal_err)?
             .ok_or_else(|| {
                 jsonrpsee::types::ErrorObjectOwned::owned(
                     jsonrpsee::types::error::INVALID_PARAMS_CODE,
-                    "Latest block not found",
+                    format!("Block not found: {requested_block}"),
                     None::<String>,
                 )
             })?;
@@ -526,7 +908,7 @@ where
         //    `evm_env` moves into the EVM, and `TxEnv::default()` hardcodes
         //    Some(1) which mismatches any non-mainnet chainspec.
         let chain_id = evm_env.cfg_env.chain_id;
-        let mut evm = OpEvmFactory::default().create_evm_with_inspector(
+        let mut evm = self.evm_config.evm_factory().create_evm_with_inspector(
             &mut state,
             evm_env,
             SimulationInspector::default(),
@@ -619,41 +1001,61 @@ where
         })?;
         let mut exposure_changes = parse_exposure_changes(&logs);
 
-        // 10. Extract trace and native transfers from the inspector. The EVM
-        //     owns it; recover a `&mut` via `components_mut()` and drain.
+        // 10. Extract trace, native transfers, and contract-management
+        //     side-effects from the inspector. The EVM owns it; recover a
+        //     `&mut` via `components_mut()` and drain.
         let (_, inspector, _) = evm.components_mut();
-        let trace = inspector.take_trace_entries();
+        let terminal_revert_reason = inspector.terminal_revert_reason();
+        let trace = inspector
+            .trace_entries()
+            .map_err(|error| internal_err(format!("simulation inspector failed: {error}")))?;
         asset_changes.extend(inspector.take_native_asset_changes());
+        let inspector_creations = inspector.take_contract_creations();
+        let force_metadata_refresh: HashSet<Address> = inspector_creations
+            .iter()
+            .map(|(_, deployed)| *deployed)
+            .collect();
+        let inspector_destructs = inspector.take_self_destructs();
 
-        // `revert_reason` is the *root cause* — the deepest reverted frame's
-        // payload — so consumers see the contract-specific custom error from
-        // the inner call rather than wrappers like EntryPoint's
-        // `FailedOp(...)` that live further up the stack. Falls back to the
-        // outer payload if the inspector somehow saw no `Revert` frame, and
-        // halts surface their `HaltReason` debug name unchanged.
+        // Halts surface their `HaltReason` debug name unchanged; the outer
+        // payload is the last resort when trace selection produced nothing.
+        let outer_revert_reason = match &result_and_state.result {
+            ExecutionResult::Revert { output, .. } => Some(decode_revert_reason(output)),
+            _ => None,
+        };
         let revert_reason = match status {
             SimulationStatus::Success => None,
-            SimulationStatus::Revert => halt_reason.or_else(|| {
-                inspector
-                    .take_deepest_revert_reason()
-                    .or_else(|| match &result_and_state.result {
-                        ExecutionResult::Revert { output, .. } => {
-                            Some(decode_revert_reason(output))
-                        }
-                        _ => None,
-                    })
-            }),
+            SimulationStatus::Revert => halt_reason
+                .or(terminal_revert_reason)
+                .or(outer_revert_reason),
         };
+
+        // Apply the simulated state diff to the in-memory DB before metadata
+        // lookup. This keeps the RPC non-persistent while letting tokens
+        // created or initialized by the simulation answer name/symbol/decimals.
+        drop(evm);
+        state.commit(result_and_state.state.clone());
 
         // 11. Resolve on-chain token metadata (name, symbol, decimals) — cached
         resolve_all_metadata(
-            &self.client,
             &self.evm_config,
             header.header(),
-            block_id,
+            &mut state,
             &self.metadata_cache,
+            &force_metadata_refresh,
             &mut asset_changes,
             &mut exposure_changes,
+        );
+
+        // 12. Assemble `contract_management` from inspector-captured
+        //     CREATE/SELFDESTRUCT plus event-derived proxy / ownership /
+        //     module changes. The map is keyed by the **target** contract
+        //     address (the one whose state changed).
+        let contract_management = assemble_contract_management(
+            inspector_creations,
+            inspector_destructs,
+            &logs,
+            &result_and_state.state,
         );
 
         Ok(SimulateUnsignedUserOpResult {
@@ -664,44 +1066,15 @@ where
             asset_changes,
             exposure_changes,
             trace,
+            contract_management,
             warnings: vec![],
         })
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Event signatures (keccak256 of canonical event strings)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// `Transfer(address,address,uint256)` — ERC-20 and ERC-721
-const TRANSFER_TOPIC: B256 =
-    alloy_primitives::b256!("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef");
-
-/// `TransferSingle(address,address,address,uint256,uint256)` — ERC-1155
-const TRANSFER_SINGLE_TOPIC: B256 =
-    alloy_primitives::b256!("c3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62");
-
-/// `TransferBatch(address,address,address,uint256[],uint256[])` — ERC-1155
-const TRANSFER_BATCH_TOPIC: B256 =
-    alloy_primitives::b256!("4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb");
-
-/// `Approval(address,address,uint256)` — ERC-20 and ERC-721
-const APPROVAL_TOPIC: B256 =
-    alloy_primitives::b256!("8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925");
-
-/// `ApprovalForAll(address,address,bool)` — ERC-721 / ERC-1155
-const APPROVAL_FOR_ALL_TOPIC: B256 =
-    alloy_primitives::b256!("17307eab39ab6107e8899845ad3d59bd9653f200f220920489ca2b5937696c31");
-
-// ═══════════════════════════════════════════════════════════════════════════════
 // Log parsing — asset changes
 // ═══════════════════════════════════════════════════════════════════════════════
-
-/// Maximum number of (id, value) pairs accepted in a single ERC-1155 TransferBatch log.
-///
-/// Bounded to prevent adversarially crafted logs from forcing huge allocations
-/// in `decode_batch_transfer_data`.
-pub const MAX_BATCH_TRANSFERS: usize = 1000;
 
 pub fn parse_asset_changes(
     logs: &[alloy_primitives::Log],
@@ -721,6 +1094,7 @@ pub fn parse_asset_changes(
                     let from = address_from_topic(topics[1]);
                     let to = address_from_topic(topics[2]);
                     let token_id = U256::from_be_bytes(topics[3].0);
+                    ensure_log_asset_change_capacity(changes.len(), 1)?;
                     changes.push(AssetChange {
                         change_type: AssetType::Erc721,
                         from,
@@ -734,6 +1108,7 @@ pub fn parse_asset_changes(
                     let from = address_from_topic(topics[1]);
                     let to = address_from_topic(topics[2]);
                     let amount = U256::from_be_slice(&log.data.data[..32]);
+                    ensure_log_asset_change_capacity(changes.len(), 1)?;
                     changes.push(AssetChange {
                         change_type: AssetType::Erc20,
                         from,
@@ -753,6 +1128,7 @@ pub fn parse_asset_changes(
                 let to = address_from_topic(topics[3]);
                 let id = U256::from_be_slice(&log.data.data[..32]);
                 let value = U256::from_be_slice(&log.data.data[32..64]);
+                ensure_log_asset_change_capacity(changes.len(), 1)?;
                 changes.push(AssetChange {
                     change_type: AssetType::Erc1155,
                     from,
@@ -770,6 +1146,7 @@ pub fn parse_asset_changes(
                 let from = address_from_topic(topics[2]);
                 let to = address_from_topic(topics[3]);
                 if let Some(pairs) = decode_batch_transfer_data(&log.data.data)? {
+                    ensure_log_asset_change_capacity(changes.len(), pairs.len())?;
                     for (id, value) in pairs {
                         changes.push(AssetChange {
                             change_type: AssetType::Erc1155,
@@ -787,6 +1164,15 @@ pub fn parse_asset_changes(
     }
 
     Ok(changes)
+}
+
+/// Ensure that the number of asset changes from logs does not exceed the maximum allowed.
+fn ensure_log_asset_change_capacity(current: usize, additional: usize) -> Result<(), &'static str> {
+    if current.saturating_add(additional) > MAX_LOG_ASSET_CHANGES {
+        return Err("log asset change limit exceeded");
+    }
+
+    Ok(())
 }
 
 /// Decode ABI-encoded `(uint256[], uint256[])` from TransferBatch data.
@@ -919,22 +1305,174 @@ pub fn parse_exposure_changes(logs: &[alloy_primitives::Log]) -> Vec<ExposureCha
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Revert reason decoding
+// Log parsing — contract management
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// `Error(string)` selector — `keccak256("Error(string)")[..4]`.
-const ERROR_STRING_SELECTOR: [u8; 4] = [0x08, 0xc3, 0x79, 0xa0];
+/// Detect proxy upgrades, ownership changes, and Safe module changes from
+/// emitted events. Returns `(target_contract, action)` pairs — the caller
+/// merges these with inspector-captured CONTRACT_CREATION / SELF_DESTRUCT
+/// entries into the response's `contract_management` map.
+///
+/// The map key on the wire is the address of the **target** (i.e. the
+/// proxy / owned contract / Safe), which is just `log.address` for every
+/// event we care about here.
+pub fn parse_contract_management_events(
+    logs: &[alloy_primitives::Log],
+) -> Vec<(Address, ContractManagementAction)> {
+    let mut out = Vec::new();
+    for log in logs {
+        let topics = log.topics();
+        let Some(topic0) = topics.first() else {
+            continue;
+        };
+        let action_type = match *topic0 {
+            UPGRADED_TOPIC | BEACON_UPGRADED_TOPIC | DIAMOND_CUT_TOPIC => {
+                ContractManagementType::ProxyUpgrade
+            }
+            // AdminChanged is admin-slot rotation; a new admin can swap the
+            // implementation, so we surface it as an ownership-class change.
+            ADMIN_CHANGED_TOPIC => ContractManagementType::OwnershipChange,
+            OWNERSHIP_TRANSFERRED_TOPIC => {
+                // OZ `Ownable` constructors emit `OwnershipTransferred(0x0, deployer)`
+                // on every deployment. Suppress the constructor case so newly
+                // deployed contracts don't surface a phantom OWNERSHIP_CHANGE.
+                if topics.len() >= 2 && address_from_topic(topics[1]) == Address::ZERO {
+                    continue;
+                }
+                ContractManagementType::OwnershipChange
+            }
+            SAFE_ADDED_OWNER_TOPIC | SAFE_REMOVED_OWNER_TOPIC | SAFE_CHANGED_THRESHOLD_TOPIC => {
+                ContractManagementType::OwnershipChange
+            }
+            SAFE_ENABLED_MODULE_TOPIC | SAFE_DISABLED_MODULE_TOPIC => {
+                ContractManagementType::ModuleChange
+            }
+            _ => continue,
+        };
+        out.push((
+            log.address,
+            ContractManagementAction {
+                action_type,
+                deployer_address: None,
+            },
+        ));
+    }
+    out
+}
 
-/// `Panic(uint256)` selector — `keccak256("Panic(uint256)")[..4]`.
-const PANIC_UINT256_SELECTOR: [u8; 4] = [0x4e, 0x48, 0x7b, 0x71];
+/// Detect proxy upgrades from raw storage-slot writes — signature-agnostic, so
+/// it catches custom or non-emitting proxies that event matching misses.
+///
+/// Walks the post-execution state diff and yields `(target, action)` for each
+/// account that wrote to a recognised proxy slot with a value different from
+/// pre-state. Admin-slot writes surface as `OWNERSHIP_CHANGE` (privilege
+/// rotation); all other recognised slots surface as `PROXY_UPGRADE`.
+pub fn parse_contract_management_state_diff<S>(
+    state: &std::collections::HashMap<Address, revm::state::Account, S>,
+) -> Vec<(Address, ContractManagementAction)>
+where
+    S: std::hash::BuildHasher,
+{
+    let mut out = Vec::new();
+    for (addr, account) in state {
+        for (slot_key, slot) in &account.storage {
+            if slot.original_value() == slot.present_value() {
+                continue;
+            }
+            let key_b256: B256 = (*slot_key).into();
+            let action_type = match key_b256 {
+                EIP1967_IMPLEMENTATION_SLOT
+                | EIP1967_BEACON_SLOT
+                | EIP1822_PROXIABLE_SLOT
+                | OZ_LEGACY_IMPLEMENTATION_SLOT => ContractManagementType::ProxyUpgrade,
+                EIP1967_ADMIN_SLOT => ContractManagementType::OwnershipChange,
+                _ => continue,
+            };
+            out.push((
+                *addr,
+                ContractManagementAction {
+                    action_type,
+                    deployer_address: None,
+                },
+            ));
+        }
+    }
+    out
+}
 
-/// Minimum payload length for a well-formed `Error(string)` revert:
-/// selector(4) + string-offset(32) + string-length(32).
-const MIN_ERROR_STRING_LEN: usize = 4 + 32 + 32;
+/// Merge inspector-captured CREATE/SELFDESTRUCT with event- and state-diff-
+/// derived proxy/ownership/module changes into a single deduped map keyed by
+/// target contract address. BTreeMap for deterministic JSON key order.
+///
+/// Two suppressions, both about not double-counting:
+///
+/// 1. **Fresh-deploy filter.** A new EIP-1967 proxy's constructor writes its
+///    implementation slot (0 → impl) and may emit `Upgraded(impl)` — both look
+///    identical to a real upgrade but are initialization. The CREATION entry
+///    already covers the contract; entries from event or state-diff detectors
+///    targeting an address created in this same tx are dropped.
+///
+/// 2. **Event/state-diff overlap.** State-diff is a fallback for non-emitting
+///    proxies. When an EIP-1967 proxy is upgraded, both the `Upgraded` event
+///    fires and the implementation slot is written — without dedup the
+///    response would carry two PROXY_UPGRADE entries for the same action.
+///    State-diff entries are dropped when an event-path entry of the same
+///    `(target, action_type)` was already recorded.
+pub fn assemble_contract_management<S>(
+    inspector_creations: Vec<(Address, Address)>,
+    inspector_destructs: Vec<Address>,
+    logs: &[alloy_primitives::Log],
+    state: &std::collections::HashMap<Address, revm::state::Account, S>,
+) -> BTreeMap<Address, Vec<ContractManagementAction>>
+where
+    S: std::hash::BuildHasher,
+{
+    let mut contract_management: BTreeMap<Address, Vec<ContractManagementAction>> = BTreeMap::new();
+    let created_in_tx: std::collections::HashSet<Address> = inspector_creations
+        .iter()
+        .map(|(_, deployed)| *deployed)
+        .collect();
+    for (deployer, deployed) in inspector_creations {
+        contract_management
+            .entry(deployed)
+            .or_default()
+            .push(ContractManagementAction {
+                action_type: ContractManagementType::ContractCreation,
+                deployer_address: Some(deployer),
+            });
+    }
+    for destroyed in inspector_destructs {
+        contract_management
+            .entry(destroyed)
+            .or_default()
+            .push(ContractManagementAction {
+                action_type: ContractManagementType::SelfDestruct,
+                deployer_address: None,
+            });
+    }
+    for (target, action) in parse_contract_management_events(logs) {
+        if created_in_tx.contains(&target) {
+            continue;
+        }
+        contract_management.entry(target).or_default().push(action);
+    }
+    for (target, action) in parse_contract_management_state_diff(state) {
+        if created_in_tx.contains(&target) {
+            continue;
+        }
+        if let Some(existing) = contract_management.get(&target)
+            && existing.iter().any(|a| a.action_type == action.action_type)
+        {
+            continue;
+        }
+        contract_management.entry(target).or_default().push(action);
+    }
+    contract_management
+}
 
-/// Minimum payload length for a well-formed `Panic(uint256)` revert:
-/// selector(4) + uint256(32).
-const MIN_PANIC_UINT256_LEN: usize = 4 + 32;
+// ═══════════════════════════════════════════════════════════════════════════════
+// Revert reason decoding
+// ═══════════════════════════════════════════════════════════════════════════════
 
 /// Solidity panic codes — see the [Solidity docs][1] for the canonical list.
 /// Sentinel returned when the panic code is too large to fit in u64.
@@ -957,25 +1495,32 @@ mod panic_code {
 }
 
 /// Decode revert data into a human-readable string.
-/// Handles `Error(string)` and `Panic(uint256)`; falls back to hex for
-/// custom errors and other unknown payloads.
+/// Handles `Error(string)`, `Panic(uint256)`, and Safe's no-argument
+/// `ExecutionFailed()` wrapper; falls back to hex for other custom errors and
+/// unknown payloads.
 pub fn decode_revert_reason(output: &Bytes) -> String {
     if output.len() < 4 {
         return format!("0x{}", hex::encode(output.as_ref()));
+    }
+
+    if output.as_ref() == EXECUTION_FAILED_SELECTOR {
+        return "ExecutionFailed()".to_string();
     }
 
     let selector = &output[..4];
 
     if selector == ERROR_STRING_SELECTOR && output.len() >= MIN_ERROR_STRING_LEN {
         let offset: usize = U256::from_be_slice(&output[4..36]).try_into().unwrap_or(0);
-        let abs_offset = 4 + offset;
-        if abs_offset + 32 <= output.len() {
-            let len: usize = U256::from_be_slice(&output[abs_offset..abs_offset + 32])
+        if let Some(abs_offset) = offset.checked_add(4)
+            && let Some(str_start) = abs_offset.checked_add(32)
+            && str_start <= output.len()
+        {
+            let len: usize = U256::from_be_slice(&output[abs_offset..str_start])
                 .try_into()
                 .unwrap_or(0);
-            let str_start = abs_offset + 32;
-            if str_start + len <= output.len()
-                && let Ok(s) = std::str::from_utf8(&output[str_start..str_start + len])
+            if let Some(str_end) = str_start.checked_add(len)
+                && str_end <= output.len()
+                && let Ok(s) = std::str::from_utf8(&output[str_start..str_end])
             {
                 return s.to_string();
             }
@@ -1007,13 +1552,6 @@ pub fn decode_revert_reason(output: &Bytes) -> String {
 // Selector-to-name mapping
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Well-known ERC-20 metadata view selectors. Defined here so they're shared
-/// between trace decoding (`selector_to_name`) and the metadata resolver, which
-/// needs the raw bytes to make the calls.
-pub const NAME_SELECTOR: [u8; 4] = [0x06, 0xfd, 0xde, 0x03]; // name()
-pub const SYMBOL_SELECTOR: [u8; 4] = [0x95, 0xd8, 0x9b, 0x41]; // symbol()
-pub const DECIMALS_SELECTOR: [u8; 4] = [0x31, 0x3c, 0xe5, 0x67]; // decimals()
-
 /// Best-effort decode of a 4-byte function selector to a human-readable name.
 pub fn selector_to_name(selector: [u8; 4]) -> Option<&'static str> {
     match selector {
@@ -1036,6 +1574,9 @@ pub fn selector_to_name(selector: [u8; 4]) -> Option<&'static str> {
         [0xb6, 0x1d, 0x27, 0xf6] => Some("execute"),
         [0x51, 0x94, 0x54, 0x47] => Some("executeBatch"),
         [0x8d, 0x80, 0xff, 0x0a] => Some("multiSend"),
+        // Safe ERC-4337 execution
+        EXECUTE_USER_OP_SELECTOR => Some("executeUserOp"),
+        EXEC_TRANSACTION_FROM_MODULE_SELECTOR => Some("execTransactionFromModule"),
         // Safe admin methods (flagged by backend as forbidden)
         [0x0d, 0x58, 0x2f, 0x13] => Some("addOwnerWithThreshold"),
         [0xf8, 0xdc, 0x5d, 0xd9] => Some("removeOwner"),
@@ -1062,30 +1603,34 @@ pub fn selector_to_name(selector: [u8; 4]) -> Option<&'static str> {
 ///
 /// Each token previously paid for 3 separate state-provider open + EVM build
 /// cycles; this batches all 3·N calls onto the same warm state cache.
-fn run_metadata_calls<Client>(
-    client: &Client,
-    evm_config: &OpEvmConfig,
-    header: &alloy_consensus::Header,
-    block_id: alloy_rpc_types::BlockId,
+fn run_metadata_calls<EvmConfig, N, Tx, DB>(
+    evm_config: &EvmConfig,
+    header: &Header,
+    state: &mut State<DB>,
     tokens: &[(Address, AssetType)],
 ) -> Vec<(Address, AssetInfo)>
 where
-    Client: StateProviderFactory + HeaderProvider<Header = alloy_consensus::Header>,
+    DB: Database + Debug,
+    EvmConfig: ConfigureEvm<Primitives = N>,
+    <EvmConfig::BlockExecutorFactory as BlockExecutorFactory>::EvmFactory: EvmFactory<Tx = OpTx>,
+    N: NodePrimitives<
+            Receipt = OpReceipt,
+            SignedTx = Tx,
+            BlockHeader = Header,
+            BlockBody = BlockBody<Tx>,
+            Block = Block<Tx>,
+        >,
+    Tx: FullSignedTx,
 {
     let Ok(mut evm_env) = evm_config.evm_env(header) else {
         return Vec::new();
     };
     relax_cfg_for_simulation(&mut evm_env.cfg_env);
 
-    let Ok(state_provider) = client.state_by_block_id(block_id) else {
-        return Vec::new();
-    };
-    let db = StateProviderDatabase::new(state_provider.as_ref());
-    let mut state = State::builder().with_database(db).build();
     // Capture chain_id before `evm_env` moves into the EVM — `TxEnv::default()`
     // hardcodes Some(1), which would mismatch any non-mainnet chainspec.
     let chain_id = evm_env.cfg_env.chain_id;
-    let mut evm = OpEvmFactory::default().create_evm(&mut state, evm_env);
+    let mut evm = evm_config.evm_factory().create_evm(state, evm_env);
 
     let mut call_view = |to: Address, selector: &[u8; 4]| -> Option<Bytes> {
         let tx = OpTx(OpTransaction {
@@ -1141,44 +1686,68 @@ fn decode_abi_string(data: &[u8]) -> Option<String> {
         return None;
     }
     let offset: usize = U256::from_be_slice(&data[..32]).try_into().ok()?;
-    if offset + 32 > data.len() {
+    let str_start = offset.checked_add(32)?;
+    if str_start > data.len() {
         return None;
     }
-    let len: usize = U256::from_be_slice(&data[offset..offset + 32])
+    let len: usize = U256::from_be_slice(&data[offset..str_start])
         .try_into()
         .ok()?;
-    let str_start = offset + 32;
-    if str_start + len > data.len() {
+    if len > MAX_METADATA_STRING_BYTES {
         return None;
     }
-    String::from_utf8(data[str_start..str_start + len].to_vec()).ok()
+    let str_end = str_start.checked_add(len)?;
+    if str_end > data.len() {
+        return None;
+    }
+    String::from_utf8(data[str_start..str_end].to_vec()).ok()
+}
+
+fn asset_metadata_is_resolved(asset: &AssetInfo) -> bool {
+    !asset.symbol.is_empty() || !asset.name.is_empty()
+}
+
+fn apply_cached_metadata(cached: &AssetInfo, asset: &mut AssetInfo) {
+    asset.symbol.clone_from(&cached.symbol);
+    asset.name.clone_from(&cached.name);
+    asset.decimals = cached.decimals;
 }
 
 /// Resolve metadata for all unique token addresses, using a persistent cache.
-fn resolve_all_metadata<Client>(
-    client: &Client,
-    evm_config: &OpEvmConfig,
-    header: &alloy_consensus::Header,
-    block_id: alloy_rpc_types::BlockId,
+fn resolve_all_metadata<EvmConfig, N, Tx, DB>(
+    evm_config: &EvmConfig,
+    header: &Header,
+    state: &mut State<DB>,
     cache: &MetadataCache,
+    force_refresh: &HashSet<Address>,
     asset_changes: &mut [AssetChange],
     exposure_changes: &mut [ExposureChange],
 ) where
-    Client: StateProviderFactory + HeaderProvider<Header = alloy_consensus::Header>,
+    DB: Database + Debug,
+    EvmConfig: ConfigureEvm<Primitives = N>,
+    <EvmConfig::BlockExecutorFactory as BlockExecutorFactory>::EvmFactory: EvmFactory<Tx = OpTx>,
+    N: NodePrimitives<
+            Receipt = OpReceipt,
+            SignedTx = Tx,
+            BlockHeader = Header,
+            BlockBody = BlockBody<Tx>,
+            Block = Block<Tx>,
+        >,
+    Tx: FullSignedTx,
 {
     // Collect unique addresses that need resolution (not in cache and not yet resolved).
     let mut to_resolve: Vec<(Address, AssetType)> = Vec::new();
 
     {
         let cache_guard = cache.lock().unwrap();
-        let mut seen_this_call = std::collections::HashSet::new();
+        let mut seen_this_call = HashSet::new();
 
         // Native ETH has its metadata pre-populated (symbol="ETH"), so the
         // `symbol.is_empty()` gate keeps `Address::ZERO` out of the resolver.
         for change in asset_changes.iter() {
             let addr = change.asset.address;
             if change.asset.symbol.is_empty()
-                && !cache_guard.contains(&addr)
+                && (force_refresh.contains(&addr) || !cache_guard.contains(&addr))
                 && seen_this_call.insert(addr)
             {
                 to_resolve.push((addr, change.asset.asset_type));
@@ -1187,7 +1756,7 @@ fn resolve_all_metadata<Client>(
         for change in exposure_changes.iter() {
             let addr = change.asset.address;
             if change.asset.symbol.is_empty()
-                && !cache_guard.contains(&addr)
+                && (force_refresh.contains(&addr) || !cache_guard.contains(&addr))
                 && seen_this_call.insert(addr)
             {
                 to_resolve.push((addr, change.asset.asset_type));
@@ -1199,10 +1768,18 @@ fn resolve_all_metadata<Client>(
     // intentionally not held during the EVM/disk work so concurrent requests
     // can read other entries in parallel.
     if !to_resolve.is_empty() {
-        let resolved = run_metadata_calls(client, evm_config, header, block_id, &to_resolve);
+        let resolved = run_metadata_calls(evm_config, header, state, &to_resolve);
         let mut cache_guard = cache.lock().unwrap();
+        for (addr, _) in to_resolve
+            .iter()
+            .filter(|(addr, _)| force_refresh.contains(addr))
+        {
+            cache_guard.pop(addr);
+        }
         for (addr, info) in resolved {
-            cache_guard.put(addr, info);
+            if asset_metadata_is_resolved(&info) {
+                cache_guard.put(addr, info);
+            }
         }
     }
 
@@ -1212,12 +1789,12 @@ fn resolve_all_metadata<Client>(
     let mut cache_guard = cache.lock().unwrap();
     for change in asset_changes.iter_mut() {
         if let Some(info) = cache_guard.get(&change.asset.address) {
-            change.asset = info.clone();
+            apply_cached_metadata(info, &mut change.asset);
         }
     }
     for change in exposure_changes.iter_mut() {
         if let Some(info) = cache_guard.get(&change.asset.address) {
-            change.asset = info.clone();
+            apply_cached_metadata(info, &mut change.asset);
         }
     }
 }
@@ -1252,7 +1829,388 @@ fn internal_err(msg: impl std::fmt::Display) -> jsonrpsee::types::ErrorObjectOwn
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
+
+    /// Completed trace entry for hand-built terminal-failure trees.
+    fn completed_trace(
+        depth: usize,
+        outcome: TraceOutcome,
+        selector: Option<[u8; 4]>,
+        revert_output: Option<&'static [u8]>,
+    ) -> RawTrace {
+        completed_trace_with_kind(TraceKind::Call, depth, outcome, selector, revert_output)
+    }
+
+    fn completed_trace_with_kind(
+        kind: TraceKind,
+        depth: usize,
+        outcome: TraceOutcome,
+        selector: Option<[u8; 4]>,
+        revert_output: Option<&'static [u8]>,
+    ) -> RawTrace {
+        assert_ne!(outcome, TraceOutcome::Halt, "use completed_halt_trace");
+        assert!(
+            outcome == TraceOutcome::Revert || revert_output.is_none(),
+            "only reverted traces may have revert output"
+        );
+        RawTrace {
+            kind,
+            from: Address::ZERO,
+            to: Some(Address::ZERO),
+            selector,
+            value: U256::ZERO,
+            depth,
+            outcome: Some(outcome),
+            revert_output: revert_output.map(Bytes::from_static),
+            halt_reason: None,
+        }
+    }
+
+    fn completed_halt_trace(
+        depth: usize,
+        selector: Option<[u8; 4]>,
+        reason: InstructionResult,
+    ) -> RawTrace {
+        RawTrace {
+            outcome: Some(TraceOutcome::Halt),
+            halt_reason: Some(reason),
+            ..completed_trace(depth, TraceOutcome::Success, selector, None)
+        }
+    }
+
+    #[test]
+    fn terminal_selection_handles_trivial_shapes() {
+        assert_eq!(terminal_failure(&[]), None);
+        assert_eq!(
+            terminal_failure(&[completed_trace(0, TraceOutcome::Success, None, None)]),
+            None
+        );
+        assert_eq!(
+            terminal_failure(&[completed_halt_trace(0, None, InstructionResult::OutOfGas,)]),
+            Some(FrameFailure::Halt(InstructionResult::OutOfGas))
+        );
+    }
+
+    #[test]
+    fn empty_revert_inherits_only_from_a_failed_last_child() {
+        // Failed child then successful sibling: nothing to inherit.
+        let superseded = [
+            completed_trace(0, TraceOutcome::Revert, None, None),
+            completed_trace(1, TraceOutcome::Revert, None, Some(b"\xaa")),
+            completed_trace(1, TraceOutcome::Success, None, None),
+        ];
+        assert_eq!(terminal_failure(&superseded), None);
+
+        // Successful child then failed sibling: the last child explains it.
+        let inherited = [
+            completed_trace(0, TraceOutcome::Revert, None, None),
+            completed_trace(1, TraceOutcome::Success, None, None),
+            completed_trace(1, TraceOutcome::Revert, None, Some(b"\xbb")),
+        ];
+        assert_eq!(
+            terminal_failure(&inherited),
+            Some(FrameFailure::Revert(&Bytes::from_static(b"\xbb")))
+        );
+
+        // A halted last child contributes its EVM failure reason.
+        let halted = [
+            completed_trace(0, TraceOutcome::Revert, None, None),
+            completed_halt_trace(1, None, InstructionResult::OutOfGas),
+        ];
+        assert_eq!(
+            terminal_failure(&halted),
+            Some(FrameFailure::Halt(InstructionResult::OutOfGas))
+        );
+    }
+
+    #[test]
+    fn last_direct_child_ignores_an_earlier_siblings_grandchildren() {
+        // Root reverts empty. First child succeeded (its own inner revert was
+        // caught and is irrelevant); the *last direct child* is the later
+        // sibling, not the deeper grandchild that appears between them.
+        let traces = [
+            completed_trace(0, TraceOutcome::Revert, None, None),
+            completed_trace(1, TraceOutcome::Success, None, None),
+            completed_trace(2, TraceOutcome::Revert, None, Some(b"\xaa")),
+            completed_trace(1, TraceOutcome::Revert, None, Some(b"\xbb")),
+        ];
+        assert_eq!(
+            terminal_failure(&traces),
+            Some(FrameFailure::Revert(&Bytes::from_static(b"\xbb")))
+        );
+    }
+
+    #[test]
+    fn safe_execution_failed_recovers_revert_from_successful_subtree() {
+        let execution_failed: &'static [u8] = &EXECUTION_FAILED_SELECTOR;
+        // executeUserOp frame reverts bare ExecutionFailed(); proxy and
+        // delegatecall layers both retain the execTransactionFromModule
+        // selector, with the caught target revert below them.
+        let traces = [
+            completed_trace(
+                0,
+                TraceOutcome::Revert,
+                Some(EXECUTE_USER_OP_SELECTOR),
+                Some(execution_failed),
+            ),
+            // Safe4337Module calls the Safe proxy.
+            completed_trace(
+                1,
+                TraceOutcome::Success,
+                Some(EXEC_TRANSACTION_FROM_MODULE_SELECTOR),
+                None,
+            ),
+            // The proxy delegates the same calldata to the Safe singleton.
+            completed_trace_with_kind(
+                TraceKind::DelegateCall,
+                2,
+                TraceOutcome::Success,
+                Some(EXEC_TRANSACTION_FROM_MODULE_SELECTOR),
+                None,
+            ),
+            completed_trace(3, TraceOutcome::Revert, None, Some(b"\xaa")),
+        ];
+        assert_eq!(
+            terminal_failure(&traces),
+            Some(FrameFailure::Revert(&Bytes::from_static(b"\xaa")))
+        );
+    }
+
+    #[test]
+    fn safe_execution_failed_recovers_revert_before_trailing_success() {
+        let execution_failed: &'static [u8] = &EXECUTION_FAILED_SELECTOR;
+        let traces = [
+            completed_trace(
+                0,
+                TraceOutcome::Revert,
+                Some(EXECUTE_USER_OP_SELECTOR),
+                Some(execution_failed),
+            ),
+            completed_trace(
+                1,
+                TraceOutcome::Success,
+                Some(EXEC_TRANSACTION_FROM_MODULE_SELECTOR),
+                None,
+            ),
+            completed_trace(2, TraceOutcome::Revert, None, Some(b"\xbb")),
+            // Safe 1.5 may run a successful post-execution check after the
+            // target call; that later success must not hide the target revert.
+            completed_trace(2, TraceOutcome::Success, None, None),
+        ];
+        assert_eq!(
+            terminal_failure(&traces),
+            Some(FrameFailure::Revert(&Bytes::from_static(b"\xbb")))
+        );
+    }
+
+    #[test]
+    fn safe_execution_failed_recovers_halt_from_successful_subtree() {
+        let execution_failed: &'static [u8] = &EXECUTION_FAILED_SELECTOR;
+        let traces = vec![
+            completed_trace(
+                0,
+                TraceOutcome::Revert,
+                Some(EXECUTE_USER_OP_SELECTOR),
+                Some(execution_failed),
+            ),
+            completed_trace(
+                1,
+                TraceOutcome::Success,
+                Some(EXEC_TRANSACTION_FROM_MODULE_SELECTOR),
+                None,
+            ),
+            completed_trace_with_kind(
+                TraceKind::DelegateCall,
+                2,
+                TraceOutcome::Success,
+                Some(EXEC_TRANSACTION_FROM_MODULE_SELECTOR),
+                None,
+            ),
+            completed_halt_trace(3, None, InstructionResult::OutOfGas),
+        ];
+
+        assert_eq!(
+            terminal_failure(&traces),
+            Some(FrameFailure::Halt(InstructionResult::OutOfGas))
+        );
+
+        let inspector = SimulationInspector {
+            traces,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            inspector.terminal_revert_reason().as_deref(),
+            Some("OutOfGas")
+        );
+        let entries = inspector.trace_entries().expect("complete trace");
+        assert_eq!(entries[3].outcome, TraceOutcome::Halt);
+        assert_eq!(entries[3].revert_reason.as_deref(), Some("OutOfGas"));
+    }
+
+    #[test]
+    fn safe_execution_failed_ignores_revert_caught_by_post_execution_check() {
+        let execution_failed: &'static [u8] = &EXECUTION_FAILED_SELECTOR;
+        let traces = [
+            completed_trace(
+                0,
+                TraceOutcome::Revert,
+                Some(EXECUTE_USER_OP_SELECTOR),
+                Some(execution_failed),
+            ),
+            completed_trace(
+                1,
+                TraceOutcome::Success,
+                Some(EXEC_TRANSACTION_FROM_MODULE_SELECTOR),
+                None,
+            ),
+            // This failed target call makes execTransactionFromModule return
+            // false and is the reason executeUserOp reverts ExecutionFailed().
+            completed_trace(2, TraceOutcome::Revert, None, Some(b"\xaa")),
+            // A later post-execution check succeeds after catching an
+            // unrelated revert inside its own subtree.
+            completed_trace(2, TraceOutcome::Success, None, None),
+            completed_trace(3, TraceOutcome::Revert, None, Some(b"\xbb")),
+        ];
+        assert_eq!(
+            terminal_failure(&traces),
+            Some(FrameFailure::Revert(&Bytes::from_static(b"\xaa")))
+        );
+    }
+
+    #[test]
+    fn safe_recovery_requires_exec_transaction_from_module() {
+        let execution_failed: &'static [u8] = &EXECUTION_FAILED_SELECTOR;
+        let traces = [
+            completed_trace(
+                0,
+                TraceOutcome::Revert,
+                Some(EXECUTE_USER_OP_SELECTOR),
+                Some(execution_failed),
+            ),
+            completed_trace(1, TraceOutcome::Success, None, None),
+            completed_trace(2, TraceOutcome::Revert, None, Some(b"\xaa")),
+        ];
+        assert_eq!(
+            terminal_failure(&traces),
+            Some(FrameFailure::Revert(&Bytes::from_static(execution_failed)))
+        );
+    }
+
+    #[test]
+    fn safe_execution_failed_falls_back_without_descendant_revert() {
+        let execution_failed: &'static [u8] = &EXECUTION_FAILED_SELECTOR;
+        // Without a descendant revert the wrapper itself is all we know.
+        let traces = [completed_trace(
+            0,
+            TraceOutcome::Revert,
+            Some(EXECUTE_USER_OP_SELECTOR),
+            Some(execution_failed),
+        )];
+        assert_eq!(
+            terminal_failure(&traces),
+            Some(FrameFailure::Revert(&Bytes::from_static(execution_failed)))
+        );
+    }
+
+    #[test]
+    fn safe_recovery_requires_exact_selector_and_payload() {
+        let execution_failed: &'static [u8] = &EXECUTION_FAILED_SELECTOR;
+        // Recovery is gated on the executeUserOp selector: any other frame
+        // reverting with the same bytes keeps its own payload.
+        let wrong_selector = [
+            completed_trace(
+                0,
+                TraceOutcome::Revert,
+                Some([0xde, 0xad, 0xbe, 0xef]),
+                Some(execution_failed),
+            ),
+            completed_trace(
+                1,
+                TraceOutcome::Success,
+                Some(EXEC_TRANSACTION_FROM_MODULE_SELECTOR),
+                None,
+            ),
+            completed_trace(2, TraceOutcome::Revert, None, Some(b"\xaa")),
+        ];
+        assert_eq!(
+            terminal_failure(&wrong_selector),
+            Some(FrameFailure::Revert(&Bytes::from_static(execution_failed)))
+        );
+
+        // ...and on an exact payload: ExecutionFailed with appended data is
+        // some other error that happens to share the selector.
+        let inexact: &'static [u8] = b"\xac\xfd\xb4\x44\xde\xad\xbe\xef";
+        let inexact_payload = [
+            completed_trace(
+                0,
+                TraceOutcome::Revert,
+                Some(EXECUTE_USER_OP_SELECTOR),
+                Some(inexact),
+            ),
+            completed_trace(
+                1,
+                TraceOutcome::Success,
+                Some(EXEC_TRANSACTION_FROM_MODULE_SELECTOR),
+                None,
+            ),
+            completed_trace(2, TraceOutcome::Revert, None, Some(b"\xaa")),
+        ];
+        assert_eq!(
+            terminal_failure(&inexact_payload),
+            Some(FrameFailure::Revert(&Bytes::from_static(inexact)))
+        );
+    }
+
+    #[test]
+    fn terminal_reason_remains_available_after_reading_trace_entries() {
+        let mut inspector = SimulationInspector::default();
+        inspector.traces.push(completed_trace(
+            0,
+            TraceOutcome::Revert,
+            None,
+            Some(b"\xaa"),
+        ));
+
+        assert_eq!(inspector.trace_entries().expect("complete trace").len(), 1);
+        assert_eq!(inspector.terminal_revert_reason().as_deref(), Some("0xaa"));
+    }
+
+    #[test]
+    fn missing_trace_entry_is_reported_without_panicking() {
+        let mut inspector = SimulationInspector::default();
+
+        assert!(
+            inspector
+                .record_trace_outcome(0, &InstructionResult::Revert, &Bytes::new())
+                .is_none()
+        );
+        assert!(matches!(
+            inspector.trace_entries(),
+            Err("simulation inspector frame referenced a missing trace entry")
+        ));
+    }
+
+    #[test]
+    fn incomplete_trace_is_reported_without_panicking() {
+        let mut inspector = SimulationInspector::default();
+        inspector.traces.push(RawTrace {
+            kind: TraceKind::Call,
+            from: Address::ZERO,
+            to: Some(Address::ZERO),
+            selector: Some([0; 4]),
+            value: U256::ZERO,
+            depth: 0,
+            outcome: None,
+            revert_output: None,
+            halt_reason: None,
+        });
+
+        assert!(matches!(
+            inspector.trace_entries(),
+            Err("simulation inspector trace frame did not complete")
+        ));
+    }
 
     /// Stand-in "malicious payload": anything that pegs a worker for longer
     /// than `SIMULATION_TIMEOUT`. Crafting bytecode that reliably blows
@@ -1323,6 +2281,218 @@ mod tests {
             waited >= Duration::from_millis(150),
             "second acquire should block until the rayon task releases its \
              permit; waited={waited:?}"
+        );
+    }
+
+    #[test]
+    fn decodes_standard_abi_metadata_string() {
+        let mut encoded = vec![0_u8; 96];
+        encoded[31] = 32;
+        encoded[63] = 3;
+        encoded[64..67].copy_from_slice(b"WLD");
+
+        assert_eq!(decode_abi_string(&encoded), Some("WLD".to_string()));
+    }
+
+    #[test]
+    fn cached_metadata_preserves_detected_asset_type() {
+        let mut asset = AssetInfo {
+            address: Address::repeat_byte(0x11),
+            symbol: String::new(),
+            name: String::new(),
+            decimals: 0,
+            asset_type: AssetType::Erc1155,
+        };
+        let cached = AssetInfo {
+            address: Address::repeat_byte(0x11),
+            symbol: "GAME".to_string(),
+            name: "Game Items".to_string(),
+            decimals: 0,
+            asset_type: AssetType::Erc20,
+        };
+
+        apply_cached_metadata(&cached, &mut asset);
+
+        assert_eq!(asset.symbol, "GAME");
+        assert_eq!(asset.name, "Game Items");
+        assert_eq!(asset.asset_type, AssetType::Erc1155);
+    }
+
+    /// A malicious `Error(string)` revert whose ABI offset field is crafted so
+    /// that `offset + 4 + 32` wraps `usize` under release (overflow-checks
+    /// off), bypassing the bounds guard and indexing far out of range.
+    #[test]
+    fn decode_revert_reason_rejects_crafted_offset_overflow() {
+        let mut payload = vec![0_u8; 100];
+        payload[0..4].copy_from_slice(&ERROR_STRING_SELECTOR);
+        let offset: u64 = u64::MAX - 10;
+        payload[28..36].copy_from_slice(&offset.to_be_bytes());
+        let output = Bytes::from(payload.clone());
+
+        assert_eq!(
+            decode_revert_reason(&output),
+            format!("0x{}", hex::encode(&payload))
+        );
+    }
+
+    #[test]
+    fn decodes_execution_failed_only_for_exact_payload() {
+        assert_eq!(
+            decode_revert_reason(&Bytes::copy_from_slice(&EXECUTION_FAILED_SELECTOR)),
+            "ExecutionFailed()"
+        );
+
+        let mut extended = EXECUTION_FAILED_SELECTOR.to_vec();
+        extended.push(0xaa);
+        assert_eq!(
+            decode_revert_reason(&Bytes::from(extended.clone())),
+            format!("0x{}", hex::encode(extended))
+        );
+    }
+
+    #[test]
+    fn decodes_safe_execution_method_selectors() {
+        assert_eq!(
+            selector_to_name(EXECUTE_USER_OP_SELECTOR),
+            Some("executeUserOp")
+        );
+        assert_eq!(
+            selector_to_name(EXEC_TRANSACTION_FROM_MODULE_SELECTOR),
+            Some("execTransactionFromModule")
+        );
+    }
+
+    #[test]
+    fn decode_abi_string_rejects_crafted_offset_overflow() {
+        let mut data = vec![0_u8; 100];
+        let offset: u64 = u64::MAX - 10;
+        data[24..32].copy_from_slice(&offset.to_be_bytes());
+
+        assert_eq!(decode_abi_string(&data), None);
+    }
+
+    fn make_transfer_batch_log(entry_count: usize) -> alloy_primitives::Log {
+        let ids_offset = 64;
+        let values_offset = ids_offset + 32 + entry_count * 32;
+
+        let mut data = Vec::new();
+
+        // The first two ABI words point to the dynamic arrays.
+        data.extend_from_slice(&U256::from(ids_offset as u64).to_be_bytes::<32>());
+        data.extend_from_slice(&U256::from(values_offset as u64).to_be_bytes::<32>());
+
+        // Encode ids.length followed by each ID.
+        data.extend_from_slice(&U256::from(entry_count as u64).to_be_bytes::<32>());
+        for id in 0..entry_count {
+            data.extend_from_slice(&U256::from(id as u64).to_be_bytes::<32>());
+        }
+
+        // Encode values.length followed by each value.
+        data.extend_from_slice(&U256::from(entry_count as u64).to_be_bytes::<32>());
+        for _ in 0..entry_count {
+            data.extend_from_slice(&U256::from(1_u64).to_be_bytes::<32>());
+        }
+
+        let operator = Address::repeat_byte(0xaa);
+        let from = Address::repeat_byte(0xbb);
+        let to = Address::repeat_byte(0xcc);
+
+        alloy_primitives::Log::new(
+            Address::repeat_byte(0x11),
+            vec![
+                TRANSFER_BATCH_TOPIC,
+                B256::left_padding_from(operator.as_slice()),
+                B256::left_padding_from(from.as_slice()),
+                B256::left_padding_from(to.as_slice()),
+            ],
+            data.into(),
+        )
+        .unwrap()
+    }
+
+    fn make_transfer_single_log() -> alloy_primitives::Log {
+        let operator = Address::repeat_byte(0xaa);
+        let from = Address::repeat_byte(0xbb);
+        let to = Address::repeat_byte(0xcc);
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&U256::from(42_u64).to_be_bytes::<32>());
+        data.extend_from_slice(&U256::from(1_u64).to_be_bytes::<32>());
+
+        alloy_primitives::Log::new(
+            Address::repeat_byte(0x11),
+            vec![
+                TRANSFER_SINGLE_TOPIC,
+                B256::left_padding_from(operator.as_slice()),
+                B256::left_padding_from(from.as_slice()),
+                B256::left_padding_from(to.as_slice()),
+            ],
+            data.into(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn parse_asset_changes_accepts_exact_limit() {
+        let batch_log = make_transfer_batch_log(MAX_LOG_ASSET_CHANGES - 1);
+        let single_log = make_transfer_single_log();
+
+        // The single transfer brings the aggregate count exactly to the limit.
+        let changes = parse_asset_changes(&[batch_log, single_log])
+            .expect("exactly MAX_LOG_ASSET_CHANGES should be accepted");
+
+        assert_eq!(changes.len(), MAX_LOG_ASSET_CHANGES);
+    }
+
+    #[test]
+    fn parse_asset_changes_rejects_limit_plus_one() {
+        let batch_log = make_transfer_batch_log(MAX_LOG_ASSET_CHANGES);
+        let single_log = make_transfer_single_log();
+
+        // The single transfer pushes the aggregate count over the limit.
+        let result = parse_asset_changes(&[batch_log, single_log]);
+
+        assert!(
+            result.is_err(),
+            "should reject more than MAX_LOG_ASSET_CHANGES"
+        );
+    }
+
+    fn encode_abi_string(value: &[u8]) -> Vec<u8> {
+        let padded_len = value.len().div_ceil(32) * 32;
+        let mut encoded = vec![0_u8; 64 + padded_len];
+
+        // The length word begins at byte 32.
+        encoded[31] = 32;
+
+        // Store the string's byte length.
+        encoded[32..64].copy_from_slice(&U256::from(value.len() as u64).to_be_bytes::<32>());
+
+        // Store the contents. The zero-filled remainder provides ABI padding.
+        encoded[64..64 + value.len()].copy_from_slice(value);
+
+        encoded
+    }
+
+    #[test]
+    fn decode_abi_string_accepts_exact_metadata_limit() {
+        let value = vec![b'A'; MAX_METADATA_STRING_BYTES];
+        let encoded = encode_abi_string(&value);
+
+        let decoded = decode_abi_string(&encoded)
+            .expect("metadata exactly at the byte limit should be accepted");
+
+        assert_eq!(decoded.as_bytes(), value.as_slice());
+    }
+
+    #[test]
+    fn decode_abi_string_rejects_metadata_limit_plus_one() {
+        let value = vec![b'A'; MAX_METADATA_STRING_BYTES + 1];
+        let encoded = encode_abi_string(&value);
+
+        assert!(
+            decode_abi_string(&encoded).is_none(),
+            "metadata above the byte limit should be rejected"
         );
     }
 }

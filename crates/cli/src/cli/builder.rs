@@ -3,8 +3,15 @@ use clap::ArgGroup;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use hex::FromHex;
 use reth_network_peers::TrustedPeer;
+use std::path::PathBuf;
 
 use crate::cli::p2p::FanoutArgs;
+
+/// Default number of flashblocks sentries a client maintains as trusted RLPx peers.
+///
+/// In non critical scenarios, relying on a single sentry to supply flashblocks
+/// should be adequate. Users running critical infrastructure may want 2.
+pub const DEFAULT_MAX_SENTRY_CONNECTIONS: usize = 1;
 
 /// Parameters for pbh builder configuration
 #[derive(Debug, Clone, PartialEq, clap::Args)]
@@ -137,6 +144,55 @@ pub struct FlashblocksArgs {
     )]
     pub access_list: bool,
 
+    /// Store accepted flashblocks to a separate libmdbx database.
+    #[arg(
+        long = "flashblocks.store",
+        id = "flashblocks.store",
+        env = "FLASHBLOCKS_STORE",
+        requires = "flashblocks.enabled",
+        default_value_t = false
+    )]
+    pub store: bool,
+
+    /// Path to the libmdbx database directory used by --flashblocks.store.
+    ///
+    /// Defaults to <datadir>/flashblocks/flashblocks.mdbx.
+    #[arg(
+        long = "flashblocks.store-path",
+        alias = "flashblocks.store_path",
+        env = "FLASHBLOCKS_STORE_PATH",
+        requires = "flashblocks.store",
+        required = false
+    )]
+    pub store_path: Option<PathBuf>,
+
+    /// Candidate flashblocks sentries and discovery bootnodes.
+    ///
+    /// By default, clients deterministically select
+    /// `--flashblocks.max-sentry-connections` peers from this pool. The selection is stable for a
+    /// persisted P2P identity and evenly distributes clients across the pool. Every candidate is
+    /// retained as a UDP discovery bootnode, including sentries that are not selected for RLPx.
+    #[arg(
+        long = "flashblocks.sentry-peers",
+        alias = "flashblocks.sentry_peers",
+        env = "FLASHBLOCKS_SENTRY_PEERS",
+        value_delimiter = ',',
+        value_name = "ENODE",
+        required = false
+    )]
+    pub sentry_peers: Vec<TrustedPeer>,
+
+    /// Maximum number of candidate flashblocks sentries maintained as trusted RLPx peers.
+    ///
+    /// Set this to at least the sentry pool size for builders that must connect to every sentry.
+    #[arg(
+        long = "flashblocks.max-sentry-connections",
+        alias = "flashblocks.max_sentry_connections",
+        env = "FLASHBLOCKS_MAX_SENTRY_CONNECTIONS",
+        default_value_t = DEFAULT_MAX_SENTRY_CONNECTIONS
+    )]
+    pub max_sentry_connections: usize,
+
     #[command(flatten)]
     pub fanout: FanoutArgs,
 }
@@ -155,7 +211,7 @@ pub fn parse_trusted_peer(s: &str) -> eyre::Result<Vec<TrustedPeer>> {
     s.split(',')
         .map(|enode| {
             enode.parse().map_err(|err| {
-                eyre::Report::msg(format!("invalid flashblocks bootnode '{}': {}", enode, err))
+                eyre::Report::msg(format!("invalid flashblocks sentry '{}': {}", enode, err))
             })
         })
         .collect()
@@ -183,6 +239,10 @@ mod tests {
             recommit_interval: 200,
             flashblocks_interval: 200,
             access_list: true,
+            store: false,
+            store_path: None,
+            sentry_peers: Vec::new(),
+            max_sentry_connections: DEFAULT_MAX_SENTRY_CONNECTIONS,
             fanout: FanoutArgs::default(),
         };
 
@@ -214,6 +274,10 @@ mod tests {
             recommit_interval: 200,
             flashblocks_interval: 200,
             access_list: false,
+            store: false,
+            store_path: None,
+            sentry_peers: Vec::new(),
+            max_sentry_connections: DEFAULT_MAX_SENTRY_CONNECTIONS,
             fanout: FanoutArgs::default(),
         };
 
@@ -242,5 +306,22 @@ mod tests {
             "0000000000000000000000000000000000000000000000000000000000000000",
         ])
         .unwrap_err();
+    }
+
+    #[test]
+    fn flashblocks_store_requires_flashblocks_enabled() {
+        CommandParser::try_parse_from(["bin", "--flashblocks.store"]).unwrap_err();
+    }
+
+    #[test]
+    fn flashblocks_sentry_connection_policy() {
+        let args = CommandParser::parse_from([
+            "bin",
+            "--flashblocks.enabled",
+            "--flashblocks.max-sentry-connections",
+            "4",
+        ]);
+
+        assert_eq!(args.flashblocks.max_sentry_connections, 4);
     }
 }

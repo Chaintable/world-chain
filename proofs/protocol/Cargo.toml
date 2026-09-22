@@ -1,0 +1,42 @@
+[package]
+name = "world-chain-proof-protocol"
+version = "1.0.0-rc.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# workspace
+world-chain-proof-metrics.workspace = true
+
+# alloy
+alloy-primitives.workspace = true
+alloy-contract.workspace = true
+alloy-provider.workspace = true
+alloy-sol-types.workspace = true
+
+# misc
+async-trait.workspace = true
+backon.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+alloy-transport.workspace = true
+tokio.workspace = true
+
+[features]
+default = []
+
+# Proofs release train: cargo-release bumps every shared-version member in lockstep.
+[package.metadata.release]
+shared-version = "proofs"

@@ -13,11 +13,16 @@ workspace = true
 [dev-dependencies]
 # World Chain
 world-chain-node.workspace = true
+world-chain-devnet.workspace = true
+world-chain-proof-protocol.workspace = true
+world-chain-proposer.workspace = true
 world-chain-test-utils = { workspace = true}
 world-chain-primitives.workspace = true
-world-chain-builder.workspace = true
+world-chain-validator.workspace = true
+world-chain-evm.workspace = true
 world-chain-p2p = { workspace = true, features = ["test-utils"] }
 world-chain-cli.workspace = true
+world-chain-chainspec.workspace = true
 
 # reth
 reth-e2e-test-utils.workspace = true
@@ -25,7 +30,6 @@ reth-node-api.workspace = true
 reth-node-builder.workspace = true
 reth-node-core.workspace = true
 reth-optimism-node = { workspace = true, features = ["test-utils"] }
-reth-optimism-chainspec.workspace = true
 reth-optimism-primitives.workspace = true
 reth-optimism-payload-builder.workspace = true
 reth-transaction-pool.workspace = true
@@ -40,18 +44,25 @@ reth-rpc-api.workspace = true
 reth-optimism-evm.workspace = true
 reth-tracing.workspace = true
 
+# rpc
+jsonrpsee = { workspace = true, features = ["http-client"] }
+
 # alloy
+alloy-contract.workspace = true
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
 alloy-network.workspace = true
 alloy-primitives.workspace = true
-alloy-provider.workspace = true
+alloy-provider = { workspace = true, features = ["anvil-api"] }
 alloy-rpc-client.workspace = true
 alloy-rpc-types.workspace = true
 alloy-rpc-types-engine.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-signer.workspace = true
 alloy-signer-local.workspace = true
+alloy-sol-types.workspace = true
+alloy-transport.workspace = true
+alloy-transport-http.workspace = true
 
 # op-alloy
 op-alloy-consensus.workspace = true
