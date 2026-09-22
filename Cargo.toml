@@ -370,7 +370,7 @@ vergen = "10.0.1"
 vergen-git2 = "10.0.1"
 
 sha1 = "0.10"
-md5 = "0.7"
+md5 = "0.8"
 
 # Test
 testcontainers = "0.27"
