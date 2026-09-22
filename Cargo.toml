@@ -358,7 +358,7 @@ sha2 = "0.10.9"
 kzg-rs = { version = "0.2.8", features = ["rkyv", "serde"] }
 c-kzg = { version = "2.0.0", default-features = false }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
-base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 url = "2.5.7"
 brotli = "8.0.3"
 once_cell = "1.19"
